@@ -8,13 +8,13 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from hydra import compose, initialize_config_dir
 from pytorch_lightning.callbacks import ModelCheckpoint
 from sklearn.cluster import KMeans
 from torch.utils.data import DataLoader, Dataset
 
 from cents.datasets.utils import encode_context_variables
 from cents.models.normalizer import Normalizer
+from cents.utils.config_loader import load_yaml, apply_overrides
 from cents.utils.utils import _ckpt_name, get_normalizer_training_config
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -63,20 +63,18 @@ class TimeSeriesDataset(Dataset):
 
         # Load dataset-level config if not already set
         if not hasattr(self, "cfg"):
-            with initialize_config_dir(
-                config_dir=os.path.join(ROOT_DIR, "config", "dataset"),
-                version_base=None,
-            ):
-                overrides = [
-                    f"seq_len={seq_len}",
-                    f"time_series_dims={len(self.time_series_column_names)}",
-                ]
-                cfg = compose(config_name="default", overrides=overrides)
-                cfg.time_series_columns = self.time_series_column_names
-                self.numeric_context_bins = cfg.numeric_context_bins
-                context_vars = self._get_context_var_dict(data)
-                cfg.context_vars = context_vars
-                self.cfg = cfg
+            cfg = load_yaml(os.path.join(ROOT_DIR, "config", "dataset", "default.yaml"))
+            # dynamic overrides for required fields
+            dyn = [
+                f"seq_len={seq_len}",
+                f"time_series_dims={len(self.time_series_column_names)}",
+            ]
+            cfg = apply_overrides(cfg, dyn)
+            cfg.time_series_columns = self.time_series_column_names
+            self.numeric_context_bins = cfg.numeric_context_bins
+            context_vars = self._get_context_var_dict(data)
+            cfg.context_vars = context_vars
+            self.cfg = cfg
 
         self.numeric_context_bins = self.cfg.numeric_context_bins
         if not hasattr(self, "threshold"):
@@ -149,8 +147,21 @@ class TimeSeriesDataset(Dataset):
         }
         return timeseries, context_vars_dict
 
+    def __getstate__(self):
+        """
+        Make the dataset picklable for DataLoader worker processes by dropping
+        non-picklable attributes (e.g., attached Lightning normalizer module).
+
+        Note: Training workers only need access to the preprocessed `self.data`.
+        The normalizer is not used during batching, so it is safe to omit here.
+        """
+        state = self.__dict__.copy()
+        if state.get("_normalizer", None) is not None:
+            state["_normalizer"] = None
+        return state
+
     def get_train_dataloader(
-        self, batch_size: int, shuffle: bool = True, num_workers: int = 4
+        self, batch_size: int, shuffle: bool = True, num_workers: int = 9
     ) -> DataLoader:
         """
         Create a PyTorch DataLoader for training.
@@ -164,7 +175,7 @@ class TimeSeriesDataset(Dataset):
             DataLoader: Configured data loader.
         """
         return DataLoader(
-            self, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers
+            self, batch_size=batch_size, shuffle=shuffle, num_workers=9
         )
 
     def split_timeseries(self, df: pd.DataFrame) -> pd.DataFrame:
