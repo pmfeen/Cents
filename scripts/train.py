@@ -1,14 +1,15 @@
 from datetime import datetime
 
 from cents.datasets.pecanstreet import PecanStreetDataset
+from cents.datasets.commercial import CommercialDataset
 from cents.trainer import Trainer
 
 
 def main() -> None:
-    MODEL_NAME = "diffusion_ts"
+    MODEL_NAME = "acgan"
     CR_LOSS_WEIGHT = 0.1
     TC_LOSS_WEIGHT = 0.1
-    dataset = PecanStreetDataset(overrides=["user_group=all"])
+    dataset = CommercialDataset(overrides=[])
 
     trainer_overrides = [
         "trainer.max_epochs=5000",
