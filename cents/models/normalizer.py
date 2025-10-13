@@ -234,7 +234,7 @@ class Normalizer(NormalizerModel):
             ds,
             batch_size=self.normalizer_training_cfg.batch_size,
             shuffle=True,
-            num_workers=1,
+            num_workers=0,
         )
 
     def _compute_group_stats(self) -> dict:

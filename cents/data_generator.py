@@ -7,8 +7,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import pytorch_lightning as pl
 import torch
 from huggingface_hub import hf_hub_download
-from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, ListConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 import cents.models
 from cents.datasets.utils import convert_generated_data_to_df
@@ -19,6 +18,7 @@ from cents.utils.utils import (
     get_normalizer_training_config,
     parse_dims_from_name,
 )
+from cents.utils.config_loader import load_yaml, apply_overrides
 
 PKG_ROOT = Path(__file__).resolve().parent
 CONF_DIR = PKG_ROOT / "config"
@@ -76,23 +76,21 @@ class DataGenerator:
 
     def _default_cfg(self) -> DictConfig:
         """
-        Load the default Hydra config for this model_name.
-
-        Returns:
-            Composed DictConfig from 'config/config.yaml'.
+        Build a minimal default config (model + dataset) without Hydra.
         """
-        # Extract dimensions from model name
         dims = parse_dims_from_name(self.model_name)
         time_series_dims = int(dims)
 
-        with initialize_config_dir(str(CONF_DIR), version_base=None):
-            return compose(
-                config_name="config",
-                overrides=[
-                    f"model={self.model_type}",
-                    f"dataset.time_series_dims={time_series_dims}",
-                ],
-            )
+        model_cfg = load_yaml(CONF_DIR / "model" / f"{self.model_type}.yaml")
+        dataset_cfg = load_yaml(CONF_DIR / "dataset" / "default.yaml")
+        dataset_cfg = apply_overrides(
+            dataset_cfg, [f"time_series_dims={time_series_dims}"]
+        )
+
+        cfg = OmegaConf.create({})
+        cfg.model = model_cfg
+        cfg.dataset = dataset_cfg
+        return cfg
 
     def set_dataset_spec(
         self, dataset_cfg: DictConfig, ctx_codes: Dict[str, Dict[int, str]]

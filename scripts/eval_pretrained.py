@@ -1,24 +1,19 @@
 import logging
 from datetime import datetime
-from pathlib import Path
-
-from hydra import compose, initialize_config_dir
-from omegaconf import OmegaConf
 
 import wandb
+from omegaconf import OmegaConf
+
 from cents.data_generator import DataGenerator
 from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.eval.eval import Evaluator
+from cents.utils.config_loader import load_yaml
+
 
 MODEL_KEY = "Watts_1_2D"
-OVERRIDES = [
-    "dataset.user_group=pv_users",
-    "dataset.time_series_dims=2",
-    "evaluator.eval_disentanglement=False",
-    "wandb.enabled=True",
-    "wandb.project=cents",
-    "wandb.entity=michael-fuest-technical-university-of-munich",
-    f"wandb.name=eval_{MODEL_KEY}_{datetime.now().strftime('%Y%m%d-%H%M%S')}_dim2",
+DATASET_OVERRIDES = [
+    "user_group=pv_users",
+    "time_series_dims=2",
 ]
 
 
@@ -31,21 +26,28 @@ def main() -> None:
         wandb.init(
             project="cents",
             name=f"{MODEL_KEY}-eval-only-run_{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-            entity="michael-fuest-technical-university-of-munich",
+            entity="pmfeen-massachusetts-institute-of-technology",
         )
 
-    CONF_DIR = Path(__file__).resolve().parents[1] / "cents" / "config"
-    with initialize_config_dir(str(CONF_DIR), version_base=None):
-        cfg = compose(config_name="config", overrides=[f"model=acgan"] + OVERRIDES)
+    # Dataset with simple overrides (no Hydra)
+    dataset = PecanStreetDataset(overrides=DATASET_OVERRIDES)
 
-    ds_overrides = [
-        o.split("dataset.")[1] for o in OVERRIDES if o.startswith("dataset.")
-    ]
-    dataset = PecanStreetDataset(overrides=ds_overrides)
-    cfg.dataset = OmegaConf.create(OmegaConf.to_container(dataset.cfg, resolve=True))
+    # Build a minimal cfg for evaluator and generator
+    eval_cfg = load_yaml("cents/config/evaluator/default.yaml")
+    top_cfg = load_yaml("cents/config/config.yaml")
+    cfg = OmegaConf.create({})
+    cfg.evaluator = eval_cfg
+    cfg.wandb = top_cfg.get("wandb", {})
+    cfg.device = top_cfg.get("device", "auto")
+    cfg.model = OmegaConf.create({"name": MODEL_KEY})
+    cfg.dataset = OmegaConf.create(
+        OmegaConf.to_container(dataset.cfg, resolve=True)
+    )
 
     # Use the fixed checkpoint with DataGenerator
-    gen = DataGenerator(MODEL_KEY, cfg=cfg)
+    gen = DataGenerator(MODEL_KEY)
+    gen.set_dataset_spec(cfg.dataset, dataset.get_context_var_codes())
+
     results = Evaluator(cfg, dataset).evaluate_model(data_generator=gen)
     print(results)
 

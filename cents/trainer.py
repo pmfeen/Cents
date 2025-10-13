@@ -3,7 +3,7 @@ from typing import Dict, List, Optional
 
 import pytorch_lightning as pl
 import wandb
-from hydra import compose, initialize_config_dir
+from datetime import datetime
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
@@ -13,6 +13,7 @@ from cents.datasets.timeseries_dataset import TimeSeriesDataset
 from cents.eval.eval import Evaluator
 from cents.models.registry import get_model_cls
 from cents.utils.utils import get_normalizer_training_config
+from cents.utils.config_loader import load_yaml, apply_overrides
 
 PKG_ROOT = Path(__file__).resolve().parent
 CONF_DIR = PKG_ROOT / "config"
@@ -135,22 +136,38 @@ class Trainer:
 
     def _compose_cfg(self, ov: List[str]) -> DictConfig:
         """
-        Compose the full Hydra configuration by merging defaults,
-        dataset-specific config, and any user overrides.
+        Compose configuration by loading YAMLs and applying overrides.
 
-        Args:
-            ov: List of Hydra-style overrides.
-
-        Returns:
-            OmegaConf DictConfig.
+        Structure:
+            cfg.model   <- config/model/{model_type}.yaml
+            cfg.trainer <- config/trainer/{model_type}.yaml
+            cfg.dataset <- provided dataset.cfg (if any)
         """
-        base_ov = [f"model={self.model_type}", f"trainer={self.model_type}"]
-        with initialize_config_dir(str(CONF_DIR), version_base=None):
-            cfg = compose(config_name="config", overrides=base_ov + ov)
+        model_cfg = load_yaml(CONF_DIR / "model" / f"{self.model_type}.yaml")
+        trainer_cfg = load_yaml(CONF_DIR / "trainer" / f"{self.model_type}.yaml")
+
+        cfg = OmegaConf.create({})
+        cfg.model = model_cfg
+        cfg.trainer = trainer_cfg
+
         if self.dataset is not None:
             cfg.dataset = OmegaConf.create(
                 OmegaConf.to_container(self.dataset.cfg, resolve=True)
             )
+
+        cfg = apply_overrides(cfg, ov)
+
+        # Ensure required top-level fields exist without Hydra
+        if not hasattr(cfg, "device"):
+            cfg.device = "auto"
+        if not hasattr(cfg, "job_name"):
+            ds_name = getattr(cfg, "dataset", {}).get("name", "dataset") if isinstance(getattr(cfg, "dataset", {}), dict) else getattr(cfg.dataset, "name", "dataset")
+            ds_group = getattr(cfg, "dataset", {}).get("user_group", "all") if isinstance(getattr(cfg, "dataset", {}), dict) else getattr(cfg.dataset, "user_group", "all")
+            model_name = getattr(cfg.model, "name", self.model_type)
+            cfg.job_name = f"{model_name}_{ds_name}_{ds_group}"
+        if not hasattr(cfg, "run_dir") or not cfg.run_dir:
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            cfg.run_dir = str(PKG_ROOT / "outputs" / cfg.job_name / timestamp)
         return cfg
 
     def _instantiate_model(self):

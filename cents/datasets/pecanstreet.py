@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig
+from cents.utils.config_loader import load_yaml, apply_overrides
 
 from cents.datasets.timeseries_dataset import TimeSeriesDataset
 
@@ -51,10 +51,9 @@ class PecanStreetDataset(TimeSeriesDataset):
             FileNotFoundError: If required CSV files are missing.
         """
         if cfg is None:
-            with initialize_config_dir(
-                config_dir=os.path.join(ROOT_DIR, "config/dataset"), version_base=None
-            ):
-                cfg = compose(config_name="pecanstreet", overrides=overrides)
+            cfg = load_yaml(os.path.join(ROOT_DIR, "config", "dataset", "pecanstreet.yaml"))
+            if overrides:
+                cfg = apply_overrides(cfg, overrides)
 
         self.cfg = cfg
         self.name = cfg.name

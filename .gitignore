@@ -108,6 +108,7 @@ ENV/
 # Repository Specific
 cents/data/*
 cents/data/pecanstreet/*
+cents/data/commercial/*
 cents/data/custom/
 .DS_Store
 .ipynb_checkpoints
