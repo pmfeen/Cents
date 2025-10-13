@@ -14,7 +14,8 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class CommercialDataset(TimeSeriesDataset):
     def __init__(self, cfg: DictConfig = None, 
-                 overrides: Optional[List[str]] = None):
+                 overrides: Optional[List[str]] = None,
+                 skip_heavy_processing: bool = False):
         
         """
         Initializes the commercial energy dataset.
@@ -46,10 +47,18 @@ class CommercialDataset(TimeSeriesDataset):
             data=self.data,
             time_series_column_names=self.cfg.time_series_columns,
             seq_len=self.cfg.seq_len,
-            context_var_column_names=self.cfg.context_vars,
+            context_var_column_names=list(self.cfg.context_vars.keys()),
             normalize=self.cfg.normalize,
             scale=self.cfg.scale,
+            skip_heavy_processing=skip_heavy_processing,
         )
+        
+        # Force recomputation of context variables to match actual encoded data
+        print("=== FORCING CONTEXT VAR RECOMPUTATION ===")
+        context_vars = self._get_context_var_dict(self.data)
+        print(f"Computed context_vars: {context_vars}")
+        self.cfg.context_vars = context_vars
+        print("=========================================")
 
     def _load_data(self):
         """
@@ -61,7 +70,7 @@ class CommercialDataset(TimeSeriesDataset):
         metapath = os.path.join(base_path, "metadata.csv")
         if not os.path.exists(metapath):
             raise FileNotFoundError(f"Metadata file not found at {metapath}")
-        metadata = pd.read_csv(metapath)[self.cfg.metadata_columns]
+        metadata = pd.read_csv(metapath, usecols=self.cfg.metadata_columns)
 
         data_path = os.path.join(base_path, "electricity_cleaned.csv")
         if not os.path.exists(data_path):
@@ -84,6 +93,18 @@ class CommercialDataset(TimeSeriesDataset):
 
         self.data = data
         self.metadata = metadata
+        
+        # Debug: Check raw data before preprocessing
+        print("=== RAW DATA DEBUG ===")
+        print(f"Data shape: {data.shape}")
+        print(f"Metadata shape: {metadata.shape}")
+        print(f"Context vars in metadata: {[col for col in self.cfg.context_vars.keys() if col in metadata.columns]}")
+        for col in self.cfg.context_vars.keys():
+            if col in metadata.columns:
+                unique_vals = metadata[col].nunique()
+                print(f"{col}: {unique_vals} unique values, dtype: {metadata[col].dtype}")
+                print("{col}: {self.cfg.context_vars[col]}, config unique")
+        print("======================")
 
 
     def _preprocess_data(self, data):
@@ -111,17 +132,35 @@ class CommercialDataset(TimeSeriesDataset):
         # grouped = grouped[grouped["energy_meter"].apply(lambda x: not np.isnan(x).any())]
 
         grouped['year'] = grouped['datetime'].dt.year
-        grouped["month"] = grouped["datetime"].dt.month
+        grouped["month"] = grouped["datetime"].dt.month_name()
         grouped["weekday"] = grouped["datetime"].dt.day_name()
         grouped["date_day"] = grouped["datetime"].dt.day
 
         if grouped["energy_meter"].apply(lambda x: np.isnan(x).any()).any():
             raise ValueError("NaN values remain in grouped energy_meter sequences after filtering.")
 
-
         merged = pd.merge(grouped, self.metadata, how="left", left_on="dataid", right_on="building_id").drop(columns=["building_id"])
         merged.sort_values(by=["dataid", "datetime"], inplace=True)
         # merged = self._handle_missing_data(merged)
+
+        # Drop rows with NaN values in context variables
+        context_cols = [col for col in self.cfg.context_vars.keys() if col in merged.columns]
+        nan_before = merged.shape[0]
+        merged = merged.dropna(subset=context_cols)
+        nan_after = merged.shape[0]
+        if nan_before != nan_after:
+            print(f"Dropped {nan_before - nan_after} rows with NaN values in context variables")
+
+        # Debug: Check data after merging
+        print("=== AFTER MERGING DEBUG ===")
+        print(f"Merged shape: {merged.shape}")
+        for col in self.cfg.context_vars.keys():
+            if col in merged.columns:
+                unique_vals = merged[col].nunique()
+                print(f"{col}: {unique_vals} unique values, dtype: {merged[col].dtype}")
+                if unique_vals < 20:  # Only print if not too many
+                    print(f"  Values: {merged[col].unique()}")
+        print("===========================")
 
         return merged
     

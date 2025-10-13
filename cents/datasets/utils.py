@@ -108,7 +108,7 @@ def split_dataset(dataset: Dataset, val_split: float = 0.1) -> Tuple[Dataset, Da
 
 
 def encode_context_variables(
-    data: pd.DataFrame, columns_to_encode: List[str], bins: int
+    data: pd.DataFrame, columns_to_encode: List[str], bins: int, numeric_cols: List[str] = None
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[int, Any]]]:
     """
     Encodes specified columns in the DataFrame either by binning numeric columns
@@ -154,8 +154,13 @@ def encode_context_variables(
     ]
 
     for col in columns_to_encode:
-        if pd.api.types.is_numeric_dtype(encoded_data[col]):
+        if numeric_cols and col in numeric_cols:
             # Numeric column: Perform binning
+            # Handle NaN values by filling with median before binning
+            if encoded_data[col].isna().any():
+                print(f"  Warning: {col} has {encoded_data[col].isna().sum()} NaN values, filling with median")
+                encoded_data[col] = encoded_data[col].fillna(encoded_data[col].median())
+            
             binned = pd.cut(encoded_data[col], bins=bins, include_lowest=True)
             encoded_data[col] = binned.cat.codes  # Assign integer codes starting from 0
             bin_intervals = binned.cat.categories

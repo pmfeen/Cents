@@ -11,7 +11,7 @@ n_steps: 1000
 sampling_timesteps: 1000
 sampling_batch_size: 4096
 loss_type: l1 #l2
-beta_schedule: cosine #linear
+beta_schedule: cosine #linear diffusion ts paper uses linear schedule
 n_heads: 4
 mlp_hidden_times: 4
 eta: 0.0
