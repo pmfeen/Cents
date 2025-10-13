@@ -95,16 +95,12 @@ class TimeSeriesDataset(Dataset):
             self.data, self.context_var_codes = self._encode_context_vars(self.data)
         self._save_context_var_codes()
 
-        print("normalizing")
         if self.normalize:
             self._init_normalizer()
             self.data = self._normalizer.transform(self.data)
-        print("finished normalizing")
 
         self.data = self.merge_timeseries_columns(self.data)
-        print("merged time series columns")
         self.data = self.data.reset_index()
-        print("reset index")
         
         # Check if we should skip heavy processing for DDP
         is_ddp_subprocess = self._is_ddp_subprocess()
@@ -115,16 +111,11 @@ class TimeSeriesDataset(Dataset):
             # Only compute if not in DDP subprocess or if cache doesn't exist
             cache_path = self._get_rarity_cache_path()
             if self._load_rarity_cache(cache_path):
-                print("loaded cached rarity features")
                 self._rarity_computed = True
             else:
-                print("computing rarity features...")
                 self.data = self.get_frequency_based_rarity()
-                print("computed frequency based rarity")
                 self.data = self.get_clustering_based_rarity()
-                print("computed clustering based rarity")
                 self.data = self.get_combined_rarity()
-                print("computed combined rarity")
                 self._save_rarity_cache(cache_path)
                 self._rarity_computed = True
 
@@ -291,31 +282,12 @@ class TimeSeriesDataset(Dataset):
         Returns:
             Tuple of encoded DataFrame and mapping codes.
         """
-        # Debug: Check data before encoding
-        print("=== BEFORE ENCODING DEBUG ===")
-        for col in self.context_vars:
-            if col in data.columns:
-                unique_vals = data[col].nunique()
-                print(f"{col}: {unique_vals} unique values, dtype: {data[col].dtype}")
-                if pd.api.types.is_numeric_dtype(data[col]):
-                    print(f"  Range: {data[col].min()} to {data[col].max()}")
-        print("=============================")
-        
         encoded_data, mapping = encode_context_variables(
             data=data,
             columns_to_encode=self.context_vars,
             bins=self.numeric_context_bins,
             numeric_cols=getattr(self.cfg, 'numeric_cols', None),
         )
-        
-        # Debug: Check data after encoding
-        print("=== AFTER ENCODING DEBUG ===")
-        for col in self.context_vars:
-            if col in encoded_data.columns:
-                unique_vals = encoded_data[col].nunique()
-                print(f"{col}: {unique_vals} unique values, dtype: {encoded_data[col].dtype}")
-                print(f"  Range: {encoded_data[col].min()} to {encoded_data[col].max()}")
-        print("============================")
         
         return encoded_data, mapping
 
@@ -333,13 +305,11 @@ class TimeSeriesDataset(Dataset):
         numeric_cols = getattr(self.cfg, 'numeric_cols', [])
         for var in self.context_vars:
             if var in numeric_cols:
-                print(f"{var}: {self.numeric_context_bins}, config unique")
                 binned = pd.cut(
                     data[var], bins=self.numeric_context_bins, include_lowest=True
                 )
                 context_dict[var] = binned.nunique()
             else:
-                print(f"{var}: {self.context_vars[var]}, config unique")
                 context_dict[var] = data[var].astype("category").nunique()
         return context_dict
 
@@ -473,16 +443,11 @@ class TimeSeriesDataset(Dataset):
         if not self._rarity_computed:
             cache_path = self._get_rarity_cache_path()
             if self._load_rarity_cache(cache_path):
-                print("loaded cached rarity features")
                 self._rarity_computed = True
             else:
-                print("computing rarity features (deferred for DDP compatibility)")
                 self.data = self.get_frequency_based_rarity()
-                print("computed frequency based rarity")
                 self.data = self.get_clustering_based_rarity()
-                print("computed clustering based rarity")
                 self.data = self.get_combined_rarity()
-                print("computed combined rarity")
                 self._save_rarity_cache(cache_path)
                 self._rarity_computed = True
 

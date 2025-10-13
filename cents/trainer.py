@@ -86,7 +86,6 @@ class Trainer:
                 num_workers=6,  # Maximum for 7.5GB/10GB GPU usage
                 persistent_workers=True,
             )
-            print(f"got train loader with {train_loader.num_workers} workers")
             self.pl_trainer.fit(self.model, train_loader, None)
         return self
 

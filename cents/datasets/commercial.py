@@ -52,13 +52,8 @@ class CommercialDataset(TimeSeriesDataset):
             scale=self.cfg.scale,
             skip_heavy_processing=skip_heavy_processing,
         )
-        
-        # Force recomputation of context variables to match actual encoded data
-        print("=== FORCING CONTEXT VAR RECOMPUTATION ===")
         context_vars = self._get_context_var_dict(self.data)
-        print(f"Computed context_vars: {context_vars}")
         self.cfg.context_vars = context_vars
-        print("=========================================")
 
     def _load_data(self):
         """
@@ -93,18 +88,6 @@ class CommercialDataset(TimeSeriesDataset):
 
         self.data = data
         self.metadata = metadata
-        
-        # Debug: Check raw data before preprocessing
-        print("=== RAW DATA DEBUG ===")
-        print(f"Data shape: {data.shape}")
-        print(f"Metadata shape: {metadata.shape}")
-        print(f"Context vars in metadata: {[col for col in self.cfg.context_vars.keys() if col in metadata.columns]}")
-        for col in self.cfg.context_vars.keys():
-            if col in metadata.columns:
-                unique_vals = metadata[col].nunique()
-                print(f"{col}: {unique_vals} unique values, dtype: {metadata[col].dtype}")
-                print("{col}: {self.cfg.context_vars[col]}, config unique")
-        print("======================")
 
 
     def _preprocess_data(self, data):
@@ -150,17 +133,6 @@ class CommercialDataset(TimeSeriesDataset):
         nan_after = merged.shape[0]
         if nan_before != nan_after:
             print(f"Dropped {nan_before - nan_after} rows with NaN values in context variables")
-
-        # Debug: Check data after merging
-        print("=== AFTER MERGING DEBUG ===")
-        print(f"Merged shape: {merged.shape}")
-        for col in self.cfg.context_vars.keys():
-            if col in merged.columns:
-                unique_vals = merged[col].nunique()
-                print(f"{col}: {unique_vals} unique values, dtype: {merged[col].dtype}")
-                if unique_vals < 20:  # Only print if not too many
-                    print(f"  Values: {merged[col].unique()}")
-        print("===========================")
 
         return merged
     

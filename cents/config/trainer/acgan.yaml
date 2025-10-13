@@ -1,6 +1,6 @@
 precision: "16-mixed"
-accelerator: cpu
-devices: cpu
+accelerator: auto
+devices: auto
 strategy: ddp_find_unused_parameters_true
 max_epochs: 1000
 batch_size: 1024

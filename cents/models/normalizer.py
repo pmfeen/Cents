@@ -156,14 +156,6 @@ class Normalizer(NormalizerModel):
         ]
         self.time_series_dims = dataset_cfg.time_series_dims
         self.do_scale = dataset_cfg.scale
-
-        # Debug: Check what context_vars are being used
-        print("=== NORMALIZER INIT DEBUG ===")
-        print(f"Context vars from config: {dataset_cfg.context_vars}")
-        print(f"Context vars keys: {list(dataset_cfg.context_vars.keys())}")
-        for name, num_categories in dataset_cfg.context_vars.items():
-            print(f"  {name}: {num_categories} categories")
-        print("=============================")
         
         self.context_module = ContextModule(
             dataset_cfg.context_vars,
@@ -363,7 +355,6 @@ class Normalizer(NormalizerModel):
         Returns:
             DataFrame with normalized series in same columns.
         """
-        print("beginning transform")
         missing = [c for c in self.time_series_cols if c not in df.columns]
 
         if missing:
@@ -374,9 +365,6 @@ class Normalizer(NormalizerModel):
             "Normalizer.transform expects data in split format with columns "
             f"{self.time_series_cols}."
         )
-
-        print("nothing missing")
-
         df_out = df.copy()
         self.eval()
         with torch.no_grad():

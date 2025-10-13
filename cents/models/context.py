@@ -63,18 +63,7 @@ class ContextModule(nn.Module):
             embedding (Tensor): Combined embedding of shape (batch_size, embedding_dim).
             classification_logits (Dict[str, Tensor]): Logits per variable,
                 each of shape (batch_size, num_categories).
-        """
-        # Debug: Check actual values being passed
-        print("=== CONTEXT MODULE FORWARD DEBUG ===")
-        for name, tensor in context_vars.items():
-            print(f"{name}: shape={tensor.shape}, min={tensor.min().item()}, max={tensor.max().item()}")
-            if name in self.context_embeddings:
-                embedding_size = self.context_embeddings[name].num_embeddings
-                print(f"  Embedding layer size: {embedding_size}")
-                if tensor.max().item() >= embedding_size:
-                    print(f"  ERROR: Index {tensor.max().item()} >= embedding size {embedding_size}")
-        print("====================================")
-        
+        """        
         embeddings = [
             layer(context_vars[name]) for name, layer in self.context_embeddings.items()
         ]

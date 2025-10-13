@@ -19,11 +19,11 @@ def main() -> None:
     trainer_overrides = [
         "trainer.max_epochs=5000",
         # "trainer.strategy=ddp_spawn",
-        # "trainer.devices=1,2,3",  # Exclude GPU 0, use GPUs 1,2,3
-        "trainer.devices=1",
+        "trainer.devices=1,2,3",  # Exclude GPU 0, use GPUs 1,2,3
+        # "trainer.devices=1",
         "trainer.eval_after_training=True",
-        # "train.accelerator=gpu",
-        "train.accelerator=cpu",
+        "train.accelerator=gpu",
+        # "train.accelerator=cpu",
         "trainer.early_stopping.patience=100",  # Stop if no improvement for 100 epochs
         "trainer.early_stopping.monitor=train_loss",  # Monitor training loss
         "trainer.early_stopping.mode=min",  # Stop when loss stops decreasing
@@ -43,11 +43,7 @@ def main() -> None:
         overrides=trainer_overrides,
     )
 
-    print("initialized trainer")
-
     trainer.fit()
-
-    print("fit")
 
 if __name__ == "__main__":
     import os

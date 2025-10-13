@@ -1,5 +1,5 @@
 strategy: auto
-accelerator: cpu
+accelerator: auto
 devices: 1
 log_every_n_steps: 1
 hidden_dim: 512
