@@ -83,7 +83,8 @@ class Trainer:
             train_loader = self.dataset.get_train_dataloader(
                 batch_size=self.cfg.trainer.batch_size,
                 shuffle=True,
-                num_workers=4,
+                num_workers=6,  # Maximum for 7.5GB/10GB GPU usage
+                persistent_workers=True,
             )
             self.pl_trainer.fit(self.model, train_loader, None)
         return self
@@ -201,7 +202,7 @@ class Trainer:
                     f"_dim{self.cfg.dataset.time_series_dims}"
                 ),
                 save_last=tc.checkpoint.save_last,
-                save_on_train_epoch_end=True,
+                save_on_train_epoch_end=True, ### Perhaps excessive
             )
         )
         callbacks.append(EvalAfterTraining(self.cfg, self.dataset))

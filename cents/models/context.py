@@ -63,7 +63,7 @@ class ContextModule(nn.Module):
             embedding (Tensor): Combined embedding of shape (batch_size, embedding_dim).
             classification_logits (Dict[str, Tensor]): Logits per variable,
                 each of shape (batch_size, num_categories).
-        """
+        """        
         embeddings = [
             layer(context_vars[name]) for name, layer in self.context_embeddings.items()
         ]

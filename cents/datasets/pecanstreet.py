@@ -33,6 +33,7 @@ class PecanStreetDataset(TimeSeriesDataset):
         self,
         cfg: Optional[DictConfig] = None,
         overrides: Optional[List[str]] = None,
+        skip_heavy_processing: bool = False,
     ):
         """
         Initialize and preprocess the PecanStreet dataset.
@@ -84,6 +85,7 @@ class PecanStreetDataset(TimeSeriesDataset):
             seq_len=self.cfg.seq_len,
             normalize=self.cfg.normalize,
             scale=self.cfg.scale,
+            skip_heavy_processing=skip_heavy_processing,
         )
 
     def _load_data(self) -> None:

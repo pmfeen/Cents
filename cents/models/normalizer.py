@@ -156,7 +156,7 @@ class Normalizer(NormalizerModel):
         ]
         self.time_series_dims = dataset_cfg.time_series_dims
         self.do_scale = dataset_cfg.scale
-
+        
         self.context_module = ContextModule(
             dataset_cfg.context_vars,
             256,
@@ -365,7 +365,6 @@ class Normalizer(NormalizerModel):
             "Normalizer.transform expects data in split format with columns "
             f"{self.time_series_cols}."
         )
-
         df_out = df.copy()
         self.eval()
         with torch.no_grad():

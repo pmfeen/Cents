@@ -50,6 +50,7 @@ class TimeSeriesDataset(Dataset):
         normalize: bool = True,
         scale: bool = True,
         overrides: Dict[str, Any] = {},
+        skip_heavy_processing: bool = False,
     ):
         # Initialize basic attributes
         self.time_series_column_names = (
@@ -100,9 +101,23 @@ class TimeSeriesDataset(Dataset):
 
         self.data = self.merge_timeseries_columns(self.data)
         self.data = self.data.reset_index()
-        self.data = self.get_frequency_based_rarity()
-        self.data = self.get_clustering_based_rarity()
-        self.data = self.get_combined_rarity()
+        
+        # Check if we should skip heavy processing for DDP
+        is_ddp_subprocess = self._is_ddp_subprocess()
+        if skip_heavy_processing or is_ddp_subprocess:
+            print("skipped rarity computation for DDP compatibility")
+            self._rarity_computed = False
+        else:
+            # Only compute if not in DDP subprocess or if cache doesn't exist
+            cache_path = self._get_rarity_cache_path()
+            if self._load_rarity_cache(cache_path):
+                self._rarity_computed = True
+            else:
+                self.data = self.get_frequency_based_rarity()
+                self.data = self.get_clustering_based_rarity()
+                self.data = self.get_combined_rarity()
+                self._save_rarity_cache(cache_path)
+                self._rarity_computed = True
 
     @abstractmethod
     def _preprocess_data(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -161,7 +176,7 @@ class TimeSeriesDataset(Dataset):
         return state
 
     def get_train_dataloader(
-        self, batch_size: int, shuffle: bool = True, num_workers: int = 9
+        self, batch_size: int, shuffle: bool = True, num_workers: int = 9, persistent_workers: bool = False
     ) -> DataLoader:
         """
         Create a PyTorch DataLoader for training.
@@ -175,7 +190,7 @@ class TimeSeriesDataset(Dataset):
             DataLoader: Configured data loader.
         """
         return DataLoader(
-            self, batch_size=batch_size, shuffle=shuffle, num_workers=9
+            self, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=persistent_workers
         )
 
     def split_timeseries(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -267,11 +282,14 @@ class TimeSeriesDataset(Dataset):
         Returns:
             Tuple of encoded DataFrame and mapping codes.
         """
-        return encode_context_variables(
+        encoded_data, mapping = encode_context_variables(
             data=data,
             columns_to_encode=self.context_vars,
             bins=self.numeric_context_bins,
+            numeric_cols=getattr(self.cfg, 'numeric_cols', None),
         )
+        
+        return encoded_data, mapping
 
     def _get_context_var_dict(self, data: pd.DataFrame) -> Dict[str, int]:
         """
@@ -284,8 +302,9 @@ class TimeSeriesDataset(Dataset):
             dict: {var_name: num_categories}
         """
         context_dict = {}
+        numeric_cols = getattr(self.cfg, 'numeric_cols', [])
         for var in self.context_vars:
-            if pd.api.types.is_numeric_dtype(data[var]):
+            if var in numeric_cols:
                 binned = pd.cut(
                     data[var], bins=self.numeric_context_bins, include_lowest=True
                 )
@@ -416,6 +435,72 @@ class TimeSeriesDataset(Dataset):
             self.data["is_frequency_rare"] & self.data["is_pattern_rare"]
         )
         return self.data
+
+    def _ensure_rarity_computed(self):
+        """
+        Compute rarity features lazily to avoid DDP issues.
+        """
+        if not self._rarity_computed:
+            cache_path = self._get_rarity_cache_path()
+            if self._load_rarity_cache(cache_path):
+                self._rarity_computed = True
+            else:
+                self.data = self.get_frequency_based_rarity()
+                self.data = self.get_clustering_based_rarity()
+                self.data = self.get_combined_rarity()
+                self._save_rarity_cache(cache_path)
+                self._rarity_computed = True
+
+    def _get_rarity_cache_path(self) -> str:
+        """Get cache file path for rarity features."""
+        import hashlib
+        # Create a hash based on dataset characteristics for cache key
+        cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{hash(str(sorted(self.context_vars)))}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+        cache_dir = os.path.join(ROOT_DIR, "cache", "rarity")
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"rarity_{cache_hash}.pkl")
+
+    def _save_rarity_cache(self, cache_path: str) -> None:
+        """Save rarity features to cache."""
+        import pickle
+        rarity_data = {
+            'is_frequency_rare': self.data.get('is_frequency_rare'),
+            'is_pattern_rare': self.data.get('is_pattern_rare'),
+            'is_rare': self.data.get('is_rare'),
+            'cluster': self.data.get('cluster')
+        }
+        with open(cache_path, 'wb') as f:
+            pickle.dump(rarity_data, f)
+        print(f"Saved rarity cache to {cache_path}")
+
+    def _load_rarity_cache(self, cache_path: str) -> bool:
+        """Load rarity features from cache."""
+        import pickle
+        if not os.path.exists(cache_path):
+            return False
+        try:
+            with open(cache_path, 'rb') as f:
+                rarity_data = pickle.load(f)
+            for col, data in rarity_data.items():
+                if data is not None:
+                    self.data[col] = data
+            return True
+        except Exception as e:
+            print(f"Failed to load rarity cache: {e}")
+            return False
+
+    def _is_ddp_subprocess(self) -> bool:
+        """Detect if we're running in a DDP subprocess."""
+        import os
+        # Check for DDP-related environment variables
+        ddp_indicators = [
+            'LOCAL_RANK' in os.environ,
+            'WORLD_SIZE' in os.environ,
+            'RANK' in os.environ,
+            os.environ.get('CUDA_VISIBLE_DEVICES', '').count(',') > 0,  # Multiple GPUs
+        ]
+        return any(ddp_indicators)
 
     def _init_normalizer(self) -> None:
         """
