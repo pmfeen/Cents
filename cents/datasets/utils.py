@@ -157,11 +157,16 @@ def encode_context_variables(
         if numeric_cols and col in numeric_cols:
             # Numeric column: Perform binning
             # Handle NaN values by filling with median before binning
-            if encoded_data[col].isna().any():
+            if encoded_data[col].isna().all():
+                # Entire column is NaN - fill with 0 and create single bin
+                print(f"  Warning: {col} is entirely NaN, filling with 0")
+                encoded_data[col] = 0
+            elif encoded_data[col].isna().any():
                 print(f"  Warning: {col} has {encoded_data[col].isna().sum()} NaN values, filling with median")
-                encoded_data[col] = encoded_data[col].fillna(encoded_data[col].median())
+                median_val = encoded_data[col].median()
+                encoded_data[col] = encoded_data[col].fillna(median_val if pd.notna(median_val) else 0)
             
-            binned = pd.cut(encoded_data[col], bins=bins, include_lowest=True)
+            binned = pd.cut(encoded_data[col], bins=bins, include_lowest=True, duplicates='drop')
             encoded_data[col] = binned.cat.codes  # Assign integer codes starting from 0
             bin_intervals = binned.cat.categories
             # Create the mapping from integer code to bin interval

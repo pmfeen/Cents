@@ -7,21 +7,22 @@ threshold: 8
 seq_len: 24
 time_series_dims: 1
 shuffle: True
+skip_heavy_processing: False  # Skip rarity computation (for faster loading/DDP)
+max_samples: null  # Limit dataset size (null = use all data)
 path: "./data/commercial/csv"
-time_series_columns: ["energy_meter"]
+time_series_columns: "energy_meter"
 data_columns: ["dataid","energy_meter","timestamp"]
-metadata_columns: ["building_id", "site_id", "primaryspaceusage", "sub_primaryspaceusage", "sqm", "sqft", "yearbuilt"]
+metadata_columns: ["building_id", "site_id", "primaryspaceusage", "sqft", "yearbuilt"]
 numeric_context_bins: 5
-numeric_cols: ["sqm", "sqft", "yearbuilt"]  # Columns to bin as numeric
-
+numeric_cols: ["sqft", "yearbuilt"]  # Columns to bin as numeric
+reduce_cardinality: False
 context_vars: # for each desired context variable, add the name and number of categories
   year: 5
   month: 12
   weekday: 7
   site_id: 19
   primaryspaceusage: 17
-  sub_primaryspaceusage: 105
-  sqm: 5
+  # sub_primaryspaceusage: 105
   sqft: 5
   yearbuilt: 5
 

@@ -11,6 +11,7 @@ import torch
 from pytorch_lightning.callbacks import ModelCheckpoint
 from sklearn.cluster import KMeans
 from torch.utils.data import DataLoader, Dataset
+from omegaconf import ListConfig
 
 from cents.datasets.utils import encode_context_variables
 from cents.models.normalizer import Normalizer
@@ -51,8 +52,14 @@ class TimeSeriesDataset(Dataset):
         scale: bool = True,
         overrides: Dict[str, Any] = {},
         skip_heavy_processing: bool = False,
+        size: int = None,
     ):
         # Initialize basic attributes
+        # Handle OmegaConf ListConfig objects
+        if isinstance(time_series_column_names, ListConfig):
+            time_series_column_names = list(time_series_column_names)
+        if isinstance(context_var_column_names, ListConfig):
+            context_var_column_names = list(context_var_column_names)
         self.time_series_column_names = (
             time_series_column_names
             if isinstance(time_series_column_names, list)
@@ -91,6 +98,10 @@ class TimeSeriesDataset(Dataset):
 
         # Preprocess and optionally encode context
         self.data = self._preprocess_data(data)
+
+        if size is not None:
+            self.data = self.data.sample(size)
+            print(f"Sampled {size} rows from dataset")
         if self.context_vars:
             self.data, self.context_var_codes = self._encode_context_vars(self.data)
         self._save_context_var_codes()
@@ -108,6 +119,7 @@ class TimeSeriesDataset(Dataset):
             print("skipped rarity computation for DDP compatibility")
             self._rarity_computed = False
         else:
+            print("Computing rarity features...")
             # Only compute if not in DDP subprocess or if cache doesn't exist
             cache_path = self._get_rarity_cache_path()
             if self._load_rarity_cache(cache_path):
@@ -118,7 +130,6 @@ class TimeSeriesDataset(Dataset):
                 self.data = self.get_combined_rarity()
                 self._save_rarity_cache(cache_path)
                 self._rarity_computed = True
-
     @abstractmethod
     def _preprocess_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -176,7 +187,7 @@ class TimeSeriesDataset(Dataset):
         return state
 
     def get_train_dataloader(
-        self, batch_size: int, shuffle: bool = True, num_workers: int = 9, persistent_workers: bool = False
+        self, batch_size: int, shuffle: bool = True, num_workers: int = 8, persistent_workers: bool = True
     ) -> DataLoader:
         """
         Create a PyTorch DataLoader for training.
