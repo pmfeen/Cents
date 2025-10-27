@@ -75,13 +75,6 @@ class PecanStreetDataset(TimeSeriesDataset):
         self._load_data()
         self._set_user_flags()
         
-        # Apply max_samples limit if specified
-        if hasattr(cfg, 'max_samples') and cfg.max_samples is not None:
-            original_len = len(self.data)
-            if original_len > cfg.max_samples:
-                self.data = self.data.sample(n=cfg.max_samples, random_state=42).reset_index(drop=True)
-                print(f"Limited dataset to {cfg.max_samples} samples (from {original_len} total)")
-
         ts_cols: List[str] = self.cfg.time_series_columns[: self.time_series_dims]
 
         super().__init__(

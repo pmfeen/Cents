@@ -46,9 +46,11 @@ class DataGenerator:
 
     def __init__(
         self,
-        model_name: str,
+        model_name: str = None,
+        model_type: str = None,
         device: str = None,
         cfg: DictConfig = None,
+        dataset = None,
         model: Optional[pl.LightningModule] = None,
         normalizer: Optional[Normalizer] = None,
     ):
@@ -71,8 +73,22 @@ class DataGenerator:
             self.model = None
             self.normalizer = None
             self.load_pretrained(model_name)
+        elif model_type is not None:
+            # Init without loading - user will call load_from_checkpoint separately
+            self.model_type = model_type
+            self.model = None
+            self.normalizer = None
+            if dataset is not None:
+                self.cfg = cfg or OmegaConf.create({})
+                if not hasattr(self.cfg, 'dataset'):
+                    self.cfg.dataset = dataset.cfg
+                if not hasattr(self.cfg, 'model'):
+                    self.cfg.model = load_yaml(CONF_DIR / "model" / f"{model_type}.yaml")
+                self.set_dataset_spec(
+                    self.cfg.dataset, self._read_ctx_codes(self.cfg.dataset.name)
+                )
         else:
-            raise ValueError("Must provide either model_name or model instance.")
+            raise ValueError("Must provide either model_name, model_type, or model instance.")
 
     def _default_cfg(self) -> DictConfig:
         """
@@ -194,6 +210,7 @@ class DataGenerator:
         ModelCls = get_model_cls(self.model_type)
 
         if ckpt_path.suffix == ".ckpt":
+            print(f"[Cents] Loading model from checkpoint: {ckpt_path}")
             self.model = (
                 ModelCls.load_from_checkpoint(
                     cfg=self.cfg,

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from cents.datasets.utils import split_timeseries
 from cents.models.base import NormalizerModel
@@ -234,7 +235,8 @@ class Normalizer(NormalizerModel):
             ds,
             batch_size=self.normalizer_training_cfg.batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=23,
+            persistent_workers=True
         )
 
     def _compute_group_stats(self) -> dict:
@@ -368,7 +370,7 @@ class Normalizer(NormalizerModel):
         df_out = df.copy()
         self.eval()
         with torch.no_grad():
-            for i, row in df_out.iterrows():
+            for i, row in tqdm(df_out.iterrows(), total=len(df_out), desc="Normalizing"):
                 ctx = {
                     v: torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
                     for v in self.context_vars
@@ -410,7 +412,7 @@ class Normalizer(NormalizerModel):
         df_out = df.copy()
         self.eval()
         with torch.no_grad():
-            for i, row in df_out.iterrows():
+            for i, row in tqdm(df_out.iterrows(), total=len(df_out), desc="Inverse normalizing"):
                 ctx = {
                     v: torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
                     for v in self.context_vars

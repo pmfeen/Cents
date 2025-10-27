@@ -42,13 +42,6 @@ class CommercialDataset(TimeSeriesDataset):
 
         self._load_data()
         
-        # Apply max_samples limit if specified
-        # if hasattr(cfg, 'max_samples') and cfg.max_samples is not None:
-        #     original_len = len(self.data)
-        #     if original_len > cfg.max_samples:
-        #         self.data = self.data.sample(n=cfg.max_samples, random_state=42).reset_index(drop=True)
-        #         print(f"Limited dataset to {cfg.max_samples} samples (from {original_len} total)")
-        
         self.time_series_column_names = self.cfg.time_series_columns
         self.time_series_dims = len(self.time_series_column_names)
 
@@ -95,11 +88,7 @@ class CommercialDataset(TimeSeriesDataset):
             metadata = metadata[metadata["site_id"] == self.geography]
 
         self.data = data
-
-        print("Data head \n :" + str(self.data.head()) + "\n")
         self.metadata = metadata
-
-        print(f"Completed Loading Data: {metadata.sqft.notna().sum()} out of {metadata.sqft.size} not na")
 
     def _preprocess_data(self, data):
         """
@@ -138,16 +127,6 @@ class CommercialDataset(TimeSeriesDataset):
         merged.sort_values(by=["dataid", "date"], inplace=True)
 
         merged = self._handle_missing_data(merged)
-        if hasattr(self.cfg, 'reduce_cardinality') and self.cfg.reduce_cardinality:
-            if 'sub_primaryspaceusage' in merged.columns:
-                print(f"Original sub_primaryspaceusage categories: {merged['sub_primaryspaceusage'].nunique()}")
-                merged = self._reduce_high_cardinality_features(
-                    merged, 
-                    'sub_primaryspaceusage',
-                    min_samples=self.cfg.get('min_samples_per_category', 50),
-                    max_categories=self.cfg.get('max_subcategories', 30)
-                )
-                print(f"Reduced sub_primaryspaceusage categories: {merged['sub_primaryspaceusage'].nunique()}")
         
         # Check if any NaN remains
         context_cols = [col for col in self.cfg.context_vars.keys() if col in merged.columns]

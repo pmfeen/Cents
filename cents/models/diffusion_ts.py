@@ -75,7 +75,7 @@ class Diffusion_TS(GenerativeModel):
         )
 
         # EMA helper will be initialized on train start
-        self._ema_helper: Optional[EMA] = None
+        self._ema: Optional[EMA] = None
 
         # set up beta schedule
         if cfg.model.beta_schedule == "linear":
@@ -300,8 +300,42 @@ class Diffusion_TS(GenerativeModel):
         """
         Apply EMA update after each batch end.
         """
-        if self._ema_helper:
-            self._ema_helper.update()
+        if hasattr(self, '_ema') and self._ema:
+            self._ema.update()
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """
+        Restore EMA weights from checkpoint after loading.
+        """
+        super().on_load_checkpoint(checkpoint)
+        
+        # Check if EMA weights exist in checkpoint
+        state_dict = checkpoint.get('state_dict', {})
+        ema_keys = [key for key in state_dict.keys() if key.startswith('_ema.')]
+        
+        if ema_keys:
+            if not hasattr(self, '_ema') or self._ema is None:
+                self._ema = EMA(
+                    self.model,
+                    beta=self.cfg.model.ema_decay,
+                    update_every=self.cfg.model.ema_update_interval,
+                )
+            
+            # Load EMA weights into the EMA helper
+            ema_state_dict = {}
+            for key, value in state_dict.items():
+                if key.startswith('_ema.ema_model.'):
+                    # Map '_ema.ema_model.*' -> 'ema_model.*' (remove the _ema prefix)
+                    ema_key = key.replace('_ema.ema_model.', 'ema_model.')
+                    ema_state_dict[ema_key] = value
+            
+            if ema_state_dict:
+                print(f"Loading {len(ema_state_dict)} EMA weights from checkpoint")
+                self._ema.ema_model.load_state_dict(ema_state_dict, strict=False)
+            else:
+                raise ValueError("No EMA model weights found in checkpoint")
+        else:
+            raise ValueError("No EMA keys found in checkpoint")
 
     @torch.no_grad()
     def model_predictions(
@@ -424,12 +458,25 @@ class Diffusion_TS(GenerativeModel):
             shape = (current_bs, self.seq_len, self.time_series_dims)
 
             with torch.no_grad():
-                if getattr(self.cfg.model, "use_ema_sampling", False) and hasattr(
-                    self, "_ema_helper"
-                ):
-                    samples = self._ema_helper.ema_model._generate(
-                        shape, batch_context_vars
-                    )
+                if getattr(self.cfg.model, "use_ema_sampling", False):
+                    self._ensure_ema_helper()
+                    if hasattr(self, "_ema") and self._ema:
+                        original_model = self.model
+                        self.model = self._ema.ema_model
+                        try:
+                            if self.fast_sampling:
+                                samples = self.fast_sample(shape, batch_context_vars)
+                            else:
+                                samples = self.sample(shape, batch_context_vars)
+                        finally:
+                            # Restore original model
+                            self.model = original_model
+                    else:
+                        samples = (
+                            self.fast_sample(shape, batch_context_vars)
+                            if self.fast_sampling
+                            else self.sample(shape, batch_context_vars)
+                        )
                 else:
                     samples = (
                         self.fast_sample(shape, batch_context_vars)
@@ -440,7 +487,18 @@ class Diffusion_TS(GenerativeModel):
             generated_samples.append(samples)
 
         return torch.cat(generated_samples, dim=0)
-
+        
+    def _ensure_ema_helper(self) -> None:
+        """
+        Ensure EMA helper is initialized if needed for inference.
+        """
+        if not hasattr(self, '_ema') or self._ema is None:
+            print("Initializing EMA helper for inference...")
+            self._ema = EMA(
+                self.model,
+                beta=self.cfg.model.ema_decay,
+                update_every=self.cfg.model.ema_update_interval,
+            )
 
 class EMA(nn.Module):
     """

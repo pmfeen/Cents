@@ -80,8 +80,8 @@ class TimeSeriesDataset(Dataset):
             cfg = apply_overrides(cfg, dyn)
             cfg.time_series_columns = self.time_series_column_names
             self.numeric_context_bins = cfg.numeric_context_bins
-            context_vars = self._get_context_var_dict(data)
-            cfg.context_vars = context_vars
+            # context_vars = self._get_context_var_dict(data)
+            # cfg.context_vars = context_vars
             self.cfg = cfg
 
         self.numeric_context_bins = self.cfg.numeric_context_bins
@@ -106,30 +106,46 @@ class TimeSeriesDataset(Dataset):
             self.data, self.context_var_codes = self._encode_context_vars(self.data)
         self._save_context_var_codes()
 
+        is_ddp_subprocess = self._is_ddp_subprocess()
         if self.normalize:
             self._init_normalizer()
-            self.data = self._normalizer.transform(self.data)
-
+            cache_path = self._get_normalization_cache_path()
+            
+            if cache_path.exists() and is_ddp_subprocess:
+                print(f"[DDP Subprocess] Loading pre-normalized data from cache")
+                import pickle
+                with open(cache_path, 'rb') as f:
+                    self.data = pickle.load(f)
+            else:
+                # Normalize (only main process or if cache doesn't exist)
+                if not is_ddp_subprocess:
+                    print("[Main Process] Normalizing data...")
+                self.data = self._normalizer.transform(self.data)
+                
+                # Save to cache for subprocesses (only main process)
+                if not is_ddp_subprocess:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    import pickle
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(self.data, f)
+                    print(f"[Main Process] Cached normalized data for subprocesses")
         self.data = self.merge_timeseries_columns(self.data)
         self.data = self.data.reset_index()
         
         # Check if we should skip heavy processing for DDP
-        is_ddp_subprocess = self._is_ddp_subprocess()
-        if skip_heavy_processing or is_ddp_subprocess:
+        if is_ddp_subprocess and skip_heavy_processing:
             print("skipped rarity computation for DDP compatibility")
-            self._rarity_computed = False
-        else:
-            print("Computing rarity features...")
-            # Only compute if not in DDP subprocess or if cache doesn't exist
             cache_path = self._get_rarity_cache_path()
             if self._load_rarity_cache(cache_path):
                 self._rarity_computed = True
-            else:
-                self.data = self.get_frequency_based_rarity()
-                self.data = self.get_clustering_based_rarity()
-                self.data = self.get_combined_rarity()
-                self._save_rarity_cache(cache_path)
-                self._rarity_computed = True
+        else:
+            print("Computing rarity features...")
+            self.data = self.get_frequency_based_rarity()
+            self.data = self.get_clustering_based_rarity()
+            self.data = self.get_combined_rarity()
+            rarity_cache_path = self._get_rarity_cache_path()
+            self._save_rarity_cache(rarity_cache_path)
+            self._rarity_computed = True
     @abstractmethod
     def _preprocess_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -471,6 +487,17 @@ class TimeSeriesDataset(Dataset):
         cache_dir = os.path.join(ROOT_DIR, "cache", "rarity")
         os.makedirs(cache_dir, exist_ok=True)
         return os.path.join(cache_dir, f"rarity_{cache_hash}.pkl")
+    
+    def _get_normalization_cache_path(self):
+        """Get cache file path for normalized data."""
+        import hashlib
+        from pathlib import Path
+        # Create hash based on dataset + normalizer characteristics
+        cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{self.normalize}_{self.scale}"
+        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+        cache_dir = Path(ROOT_DIR) / "cache" / "normalized_data"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / f"normalized_{cache_hash}.pkl"
 
     def _save_rarity_cache(self, cache_path: str) -> None:
         """Save rarity features to cache."""

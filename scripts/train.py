@@ -12,14 +12,11 @@ def main() -> None:
     CR_LOSS_WEIGHT = 0.1
     TC_LOSS_WEIGHT = 0.1
     # Skip heavy processing for DDP compatibility
-    dataset = CommercialDataset(
-        skip_heavy_processing=True
-    )
-
+    dataset = CommercialDataset(overrides=["skip_heavy_processing=True"])
     trainer_overrides = [
         "trainer.max_epochs=5000",
         # "trainer.strategy=ddp_spawn",
-        "trainer.devices=1,2,3",  # Exclude GPU 0, use GPUs 1,2,3
+        "trainer.devices=auto",  # Exclude GPU 0, use GPUs 1,2,3
         # "trainer.devices=1",
         "trainer.eval_after_training=True",
         "train.accelerator=gpu",
@@ -48,6 +45,6 @@ def main() -> None:
 if __name__ == "__main__":
     import os
     # Enable CUDA debugging for better error messages
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    os.environ["TORCH_USE_CUDA_DSA"] = "1"
+    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    # os.environ["TORCH_USE_CUDA_DSA"] = "1"
     main()

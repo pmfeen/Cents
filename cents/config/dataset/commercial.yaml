@@ -1,5 +1,6 @@
 name: commercial
 geography: null
+user_group: all
 normalize: True
 scale: True
 use_learned_normalizer: True
@@ -17,11 +18,11 @@ numeric_context_bins: 5
 numeric_cols: ["sqft", "yearbuilt"]  # Columns to bin as numeric
 reduce_cardinality: False
 context_vars: # for each desired context variable, add the name and number of categories
-  year: 5
+  year: 2
   month: 12
   weekday: 7
   site_id: 19
-  primaryspaceusage: 17
+  primaryspaceusage: 16
   # sub_primaryspaceusage: 105
   sqft: 5
   yearbuilt: 5

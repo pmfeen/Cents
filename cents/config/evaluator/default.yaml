@@ -1,7 +1,11 @@
-model_name: ${model.name}
+model:
+  name: diffusion_ts  # Set this to your model name
+dataset:
+  name: commercial  # Set this to your dataset name (e.g., "commercial")
 eval_pv_shift: False
 eval_metrics: True
 eval_context_sparse: True
 save_results: False
 eval_disentanglement: True
-save_dir: ${run_dir}/eval
+job_name: diffusion_ts_commercial
+save_dir: outputs/diffusion_ts_commercial/eval
