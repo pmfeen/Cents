@@ -5,6 +5,8 @@ from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
 from cents.trainer import Trainer
 from pytorch_lightning.callbacks import EarlyStopping
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 def main() -> None:
@@ -12,7 +14,7 @@ def main() -> None:
     CR_LOSS_WEIGHT = 0.1
     TC_LOSS_WEIGHT = 0.1
     # Skip heavy processing for DDP compatibility
-    dataset = CommercialDataset(overrides=["skip_heavy_processing=True"])
+    dataset = PecanStreetDataset(overrides=["skip_heavy_processing=True", "time_series_dims=1", "user_group=all"])
     trainer_overrides = [
         "trainer.max_epochs=5000",
         # "trainer.strategy=ddp_spawn",

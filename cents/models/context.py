@@ -1,8 +1,18 @@
 import torch
 import torch.nn as nn
+from abc import abstractmethod
+from .context_registry import register_context_module
 
+class BaseContextModule(nn.Module):
+    """
+    Base class for context modules. Subclasses must implement the forward method.
+    """
+    @abstractmethod
+    def forward(self, context_vars: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        pass
 
-class ContextModule(nn.Module):
+@register_context_module("default", "mlp")
+class MLPContextModule(BaseContextModule):
     """
     Integrates multiple context variables into a single embedding and provides
     auxiliary classification logits for each variable.

@@ -18,7 +18,8 @@ import torch.optim as optim
 from omegaconf import DictConfig
 
 from cents.models.base import GenerativeModel
-from cents.models.context import ContextModule
+from cents.models.context import MLPContextModule  # Import to trigger registration
+from cents.models.context_registry import get_context_module_cls
 from cents.models.model_utils import total_correlation
 from cents.models.registry import register_model
 
@@ -43,7 +44,7 @@ class Generator(nn.Module):
         embedding_dim: int,
         final_window_length: int,
         time_series_dims: int,
-        context_module: ContextModule,
+        context_module_type: str,
         context_vars: Optional[dict] = None,
         base_channels: int = 256,
     ):
@@ -56,7 +57,7 @@ class Generator(nn.Module):
         self.base_channels = base_channels
 
         self.context_vars = context_vars
-        self.context_module = context_module
+        self.context_module = get_context_module_cls(context_module_type)(context_vars, embedding_dim)
 
         in_dim = noise_dim + (embedding_dim if context_vars else 0)
         self.fc = nn.Linear(in_dim, self.final_window_length * base_channels)
@@ -199,7 +200,7 @@ class ACGAN(GenerativeModel):
             embedding_dim=cfg.model.cond_emb_dim,
             final_window_length=cfg.dataset.seq_len,
             time_series_dims=cfg.dataset.time_series_dims,
-            context_module=self.context_module,
+            context_module_type=cfg.model.context_module_type,
             context_vars=cfg.dataset.context_vars,
         )
         self.discriminator = Discriminator(

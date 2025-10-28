@@ -10,11 +10,14 @@ from tqdm import tqdm
 
 from cents.datasets.utils import split_timeseries
 from cents.models.base import NormalizerModel
-from cents.models.context import ContextModule
+from cents.models.context import MLPContextModule  # Import to trigger registration
+from cents.models.context_registry import get_context_module_cls
+from cents.models.stats_head_registry import register_stats_head, get_stats_head_cls
 from cents.models.registry import register_model
 
 
-class _StatsHead(nn.Module):
+@register_stats_head("default", "mlp")
+class MLPStatsHead(nn.Module):
     """
     Head module predicting summary statistics (mean, std, and optionally min/max z-scores) from context embedding.
     """
@@ -92,6 +95,7 @@ class _NormalizerModule(nn.Module):
         hidden_dim: int = 512,
         time_series_dims: int = 2,
         do_scale: bool = True,
+        stats_head_type: str = "mlp",
     ):
         """
         Args:
@@ -99,11 +103,14 @@ class _NormalizerModule(nn.Module):
             hidden_dim: Hidden dimension size for the stats head.
             time_series_dims: Number of time series dimensions.
             do_scale: Whether to include scaling predictions.
+            stats_head_type: Type of stats head to use (from registry).
         """
         super().__init__()
         self.cond_module = cond_module
         self.embedding_dim = cond_module.embedding_dim
-        self.stats_head = _StatsHead(
+        # Use registry to get the stats head class
+        StatsHeadCls = get_stats_head_cls(stats_head_type)
+        self.stats_head = StatsHeadCls(
             embedding_dim=self.embedding_dim,
             hidden_dim=hidden_dim,
             time_series_dims=time_series_dims,
@@ -157,17 +164,22 @@ class Normalizer(NormalizerModel):
         ]
         self.time_series_dims = dataset_cfg.time_series_dims
         self.do_scale = dataset_cfg.scale
-        
-        self.context_module = ContextModule(
-            dataset_cfg.context_vars,
-            256,
-        )
 
+        context_module_type = getattr(self.dataset_cfg, "context_module_type", "default")
+        
+        # Use registry to get the context module class
+        ContextModuleCls = get_context_module_cls(context_module_type)
+        self.context_module = ContextModuleCls(self.dataset_cfg.context_vars, 256)
+
+        # Get stats head type from config
+        stats_head_type = getattr(self.dataset_cfg, "stats_head_type", "default")
+        
         self.normalizer_model = _NormalizerModule(
             cond_module=self.context_module,
             hidden_dim=512,
             time_series_dims=self.time_series_dims,
             do_scale=self.do_scale,
+            stats_head_type=stats_head_type,
         )
 
         # Will be populated in setup()

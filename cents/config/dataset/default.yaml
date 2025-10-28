@@ -11,3 +11,4 @@ user_group: null
 
 numeric_context_bins: 5
 context_vars: {}
+stats_head_type: mlp

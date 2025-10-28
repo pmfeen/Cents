@@ -5,7 +5,8 @@ import pytorch_lightning as pl
 import torch
 from omegaconf import DictConfig
 
-from cents.models.context import ContextModule
+from cents.models.context import MLPContextModule  # Import to trigger registration
+from cents.models.context_registry import get_context_module_cls
 
 
 class BaseModel(pl.LightningModule, ABC):
@@ -38,7 +39,11 @@ class BaseModel(pl.LightningModule, ABC):
 
             if hasattr(cfg.dataset, "context_vars") and cfg.dataset.context_vars:
                 emb_dim = getattr(cfg.model, "cond_emb_dim", 256)
-                self.context_module = ContextModule(cfg.dataset.context_vars, emb_dim)
+                context_module_type = getattr(cfg.model, "context_module_type", "default")
+                
+                # Use registry to get the context module class
+                ContextModuleCls = get_context_module_cls(context_module_type)
+                self.context_module = ContextModuleCls(cfg.dataset.context_vars, emb_dim)
             else:
                 self.context_module = None
 
