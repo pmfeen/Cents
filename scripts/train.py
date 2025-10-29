@@ -6,31 +6,37 @@ from cents.datasets.commercial import CommercialDataset
 from cents.trainer import Trainer
 from pytorch_lightning.callbacks import EarlyStopping
 import warnings
+import argparse
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-def main() -> None:
-    MODEL_NAME = "diffusion_ts"
-    CR_LOSS_WEIGHT = 0.1
-    TC_LOSS_WEIGHT = 0.1
+def main(args) -> None:
+    MODEL_NAME = args.model_name
+    CR_LOSS_WEIGHT = args.cr_loss_weight
+    TC_LOSS_WEIGHT = args.tc_loss_weight
     # Skip heavy processing for DDP compatibility
-    dataset = PecanStreetDataset(overrides=["skip_heavy_processing=True", "time_series_dims=1", "user_group=all"])
+
+    if args.dataset == "pecanstreet":
+        dataset = PecanStreetDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"])
+    elif args.dataset == "commercial":
+        dataset = CommercialDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}", "time_series_dims=1", "user_group=all"])
+    else:
+        raise ValueError(f"Dataset {args.dataset} not supported")
+
     trainer_overrides = [
-        "trainer.max_epochs=5000",
-        # "trainer.strategy=ddp_spawn",
-        "trainer.devices=auto",  # Exclude GPU 0, use GPUs 1,2,3
-        # "trainer.devices=1",
-        "trainer.eval_after_training=True",
-        "train.accelerator=gpu",
-        # "train.accelerator=cpu",
+        f"trainer.max_epochs={args.epochs}",
+        f"trainer.strategy={args.ddp_strategy}",
+        f"trainer.devices={args.devices}",
+        f"trainer.eval_after_training={args.eval_after_training}",
+        f"train.accelerator={args.accelerator}",
         "trainer.early_stopping.patience=100",  # Stop if no improvement for 100 epochs
         "trainer.early_stopping.monitor=train_loss",  # Monitor training loss
         "trainer.early_stopping.mode=min",  # Stop when loss stops decreasing
-        "trainer.enable_checkpointing=True",  # Explicitly enable checkpointing
+        f"trainer.enable_checkpointing={args.enable_checkpointing}",  # Explicitly enable checkpointing
         "trainer.logger=False",  # Disable logger to see checkpoint messages
-        "wandb.enabled=False",
-        "wandb.project=cents",
-        "wandb.entity=pmfeen-massachusetts-institute-of-technology",
+        f"wandb.enabled={args.wandb_enabled}",
+        f"wandb.project={args.wandb_project}",
+        f"wandb.entity={args.wandb_entity}",
         f"model.context_reconstruction_loss_weight={CR_LOSS_WEIGHT}",
         f"model.tc_loss_weight={TC_LOSS_WEIGHT}",
         f"wandb.name=training_dai_{MODEL_NAME}_{datetime.now().strftime('%Y%m%d-%H%M%S')}_L{CR_LOSS_WEIGHT}_TC_{TC_LOSS_WEIGHT}_dim2",
@@ -45,8 +51,22 @@ def main() -> None:
     trainer.fit()
 
 if __name__ == "__main__":
-    import os
-    # Enable CUDA debugging for better error messages
-    # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    # os.environ["TORCH_USE_CUDA_DSA"] = "1"
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--devices", type=int, default="auto")
+    parser.add_argument("--accelerator", type=str, default="gpu")
+    parser.add_argument("--model_name", type=str, default="diffusion_ts")
+    parser.add_argument("--cr_loss_weight", type=float, default=0.1)
+    parser.add_argument("--tc_loss_weight", type=float, default=0.1)
+    parser.add_argument("--dataset", type=str, default="pecanstreet")
+    parser.add_argument("--epochs", type=int, default=5000)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--wandb-enabled", type=bool, default=False)
+    parser.add_argument("--wandb-project", type=str, default="cents")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("eval_after_training", type=bool, default=True)
+    parser.add_argument("skip_heavy_processing", type=bool, default=True)
+    parser.add_argument("--ddp-strategy", type=str, default="ddp_find_unused_parameters_false")
+    parser.add_argument("enable_checkpointing", type=bool, default=True)
+
+    args = parser.parse_args()
     main()
