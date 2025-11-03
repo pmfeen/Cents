@@ -17,7 +17,7 @@ numeric_cols: ["total_square_footage", "house_construction_year"]
 user_group: all # non_pv_users, all, pv_users
 numeric_context_bins: 5
 stats_head_type: mlp
-context_module_type: mlp
+context_module_type: sep_mlp
 
 context_vars: # for each desired context variable, add the name and number of categories
   month: 12

@@ -87,3 +87,60 @@ class MLPContextModule(BaseContextModule):
         }
 
         return embedding, classification_logits
+@register_context_module("default", "sep_mlp")
+class SepMLPContextModule(BaseContextModule):
+    def __init__(self, context_vars: dict[str, int], embedding_dim: int, init_depth: int = 1, mixing_depth: int = 1) -> None:
+        super().__init__()
+
+        self.embedding_dim = embedding_dim
+
+        self.context_embeddings = nn.ModuleDict(
+            {
+                name: nn.Embedding(num_categories, embedding_dim)
+                for name, num_categories in context_vars.items()
+            }
+        )
+
+        self.init_mlps = nn.ModuleDict({
+            name: nn.Sequential(*[
+                layer
+                for _ in range(init_depth)
+                for layer in (nn.Linear(embedding_dim, 128), nn.ReLU(), nn.Linear(128, embedding_dim))
+            ])
+            for name in context_vars.keys()
+        })
+
+
+        total_dim = embedding_dim * len(context_vars)
+
+        self.mixing_mlp = nn.Sequential(            
+            nn.Linear(total_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, embedding_dim))
+
+        self.classification_heads = nn.ModuleDict(
+            {
+                var_name: nn.Linear(embedding_dim, num_categories)
+                for var_name, num_categories in context_vars.items()
+            }
+        )
+
+
+    def forward(self, context_vars):
+        encodings = {
+            name : layer(context_vars[name]) for name, layer in self.context_embeddings.items()
+        }
+
+        embeddings = [
+            layer(encodings[name]) for name, layer in self.init_mlps.items()
+        ]
+
+        context_matrix = torch.cat(embeddings, dim=1)
+        embedding = self.mixing_mlp(context_matrix)
+
+        classification_logits = {
+            var_name: head(embedding)
+            for var_name, head in self.classification_heads.items()
+        }
+
+        return embedding, classification_logits

@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from cents.datasets.utils import split_timeseries
 from cents.models.base import NormalizerModel
-from cents.models.context import MLPContextModule  # Import to trigger registration
+from cents.models.context import MLPContextModule, SepMLPContextModule  # Import to trigger registration
 from cents.models.context_registry import get_context_module_cls
 from cents.models.stats_head_registry import register_stats_head, get_stats_head_cls
 from cents.models.registry import register_model
