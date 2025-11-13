@@ -140,10 +140,6 @@ class Diffusion_TS(GenerativeModel):
         
         # Get continuous variables from config to distinguish them in loss computation
         self.continuous_context_vars = getattr(cfg.dataset, "continuous_context_vars", None) or []
-        if isinstance(self.continuous_context_vars, (list, tuple)):
-            self.continuous_context_vars = set(self.continuous_context_vars)
-        else:
-            self.continuous_context_vars = set([self.continuous_context_vars]) if self.continuous_context_vars else set()
 
     def predict_noise_from_start(
         self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor
@@ -224,11 +220,11 @@ class Diffusion_TS(GenerativeModel):
         embedding, cond_classification_logits = self.context_module(context_vars)
         
         # Check embedding for NaN/Inf and extreme values
-        if embedding.isnan().any() or embedding.isinf().any():
-            raise ValueError(
-                f"NaN/Inf detected in embedding from context module. "
-                f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}"
-            )
+        # if embedding.isnan().any() or embedding.isinf().any():
+        #     raise ValueError(
+        #         f"NaN/Inf detected in embedding from context module. "
+        #         f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}"
+        #     )
         
         # Clamp extreme values to prevent numerical instability in transformer
         # Don't fully normalize as that would change the learned embedding scale
@@ -250,37 +246,37 @@ class Diffusion_TS(GenerativeModel):
             + self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * noise
         )
 
-        if x_noisy.isnan().any(): 
-            raise ValueError("NaN detected in x_noisy")
+        # if x_noisy.isnan().any(): 
+        #     raise ValueError("NaN detected in x_noisy")
         
         # Use normalized embedding for concatenation
         embedding_expanded = embedding.unsqueeze(1).repeat(1, self.seq_len, 1)
         c = torch.cat([x_noisy, embedding_expanded], dim=-1)
 
-        if c.isnan().any() or c.isinf().any():
-            raise ValueError(
-                f"NaN/Inf detected in concatenated input 'c'. "
-                f"x_noisy stats: mean={x_noisy.mean():.4f}, std={x_noisy.std():.4f}, "
-                f"min={x_noisy.min():.4f}, max={x_noisy.max():.4f}. "
-                f"embedding stats: mean={embedding.mean():.4f}, "
-                f"std={embedding.std():.4f}, min={embedding.min():.4f}, "
-                f"max={embedding.max():.4f}"
-            )
+        # if c.isnan().any() or c.isinf().any():
+        #     raise ValueError(
+        #         f"NaN/Inf detected in concatenated input 'c'. "
+        #         f"x_noisy stats: mean={x_noisy.mean():.4f}, std={x_noisy.std():.4f}, "
+        #         f"min={x_noisy.min():.4f}, max={x_noisy.max():.4f}. "
+        #         f"embedding stats: mean={embedding.mean():.4f}, "
+        #         f"std={embedding.std():.4f}, min={embedding.min():.4f}, "
+        #         f"max={embedding.max():.4f}"
+        #     )
 
-        if t.isnan().any():
-            raise ValueError("NaN detected in timestep 't'")
+        # if t.isnan().any():
+        #     raise ValueError("NaN detected in timestep 't'")
 
         trend, season = self.model(c, t, padding_masks=None)
-        if trend.isnan().any():
-            print("trend")
+        # if trend.isnan().any():
+        #     print("trend")
 
-        if season.isnan().any():
-            print("season")
+        # if season.isnan().any():
+        #     print("season")
         x_recon = self.fc(trend + season)
-        if x_recon.isnan().any():
-            print("X RECON")
-        if x.isnan().any():
-            print("x")
+        # if x_recon.isnan().any():
+        #     print("X RECON")
+        # if x.isnan().any():
+        #     print("x")
         # print("REC LOSS", x_recon, x)
         rec_loss = self.recon_loss_fn(x_recon, x)
         return rec_loss, cond_classification_logits
@@ -299,27 +295,23 @@ class Diffusion_TS(GenerativeModel):
         ts_batch, cond_batch = batch
         rec_loss, cond_class_logits = self(ts_batch, cond_batch)
         
-        # Check for NaN in reconstruction loss early
-        if torch.isnan(rec_loss) or torch.isinf(rec_loss):
-            # print(rec_loss)
-            # print(ts_batch, cond_batch)
-            raise ValueError(
-                f"NaN/Inf detected in rec_loss at batch {batch_idx}. "
-            )
-        
         cond_loss = 0.0
+
 
         for var_name, outputs in cond_class_logits.items():
             labels = cond_batch[var_name]
             
             if var_name in self.continuous_context_vars:
-                # Continuous variable: use MSE loss
-                # outputs is shape (batch_size,), labels is shape (batch_size,)
-                cond_loss += F.mse_loss(outputs, labels.float())
+                loss = F.mse_loss(outputs, labels.float())
             else:
-                # Categorical variable: use Cross-Entropy loss
-                # outputs (logits) is shape (batch_size, num_categories), labels is shape (batch_size,)
-                cond_loss += self.auxiliary_loss(outputs, labels)
+                loss = self.auxiliary_loss(outputs, labels)
+            
+            cond_loss += loss.mean()
+
+            # if var_name in self.continuous_context_vars:
+            #     print(var_name)
+            #     print(loss)
+            #     print(outputs.mean(), labels.mean())
 
         h, _ = self.context_module(cond_batch)
         tc_term = (
@@ -332,17 +324,17 @@ class Diffusion_TS(GenerativeModel):
             rec_loss + self.context_reconstruction_loss_weight * cond_loss + tc_term
         )
         
-        # Check for NaN in total loss
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            raise ValueError(
-                f"NaN/Inf detected in total_loss at batch {batch_idx}. "
-                f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss:.6f}, tc_term: {tc_term.item():.6f}"
-            )
+        # # Check for NaN in total loss
+        # if torch.isnan(total_loss) or torch.isinf(total_loss):
+        #     raise ValueError(
+        #         f"NaN/Inf detected in total_loss at batch {batch_idx}. "
+        #         f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss:.6f}, tc_term: {tc_term.item():.6f}"
+        #     )
         self.log_dict(
             {
-                "train_loss": total_loss,
-                "rec_loss": rec_loss,
-                "cond_loss": cond_loss,
+                "train_loss": total_loss.item(),
+                "rec_loss": rec_loss.item(),
+                "cond_loss": cond_loss.item(),
                 "tc_loss": tc_term,
             },
             prog_bar=True,
