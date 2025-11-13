@@ -194,13 +194,30 @@ class Trainer:
         """
         tc = self.cfg.trainer
         callbacks = []
+        # Build filename with optional context_module_type
+        filename_parts = [
+            self.cfg.dataset.name,
+            self.model_type,
+            f"dim{self.cfg.dataset.time_series_dims}"
+        ]
+        
+        # Add context_module_type if available (from model or dataset config)
+        context_module_type = getattr(
+            self.cfg.model, "context_module_type", 
+            getattr(self.cfg.dataset, "context_module_type", None)
+        )
+        if context_module_type:
+            filename_parts.append(f"ctx{context_module_type}")
+        
+        # Add stats_head_type if available (typically in dataset config for normalizer)
+        stats_head_type = getattr(self.cfg.dataset, "stats_head_type", None)
+        if stats_head_type:
+            filename_parts.append(f"stats{stats_head_type}")
+        
         callbacks.append(
             ModelCheckpoint(
                 dirpath=self.cfg.run_dir,
-                filename=(
-                    f"{self.cfg.dataset.name}_{self.model_type}"
-                    f"_dim{self.cfg.dataset.time_series_dims}"
-                ),
+                filename="_".join(filename_parts),
                 save_last=tc.checkpoint.save_last,
                 save_on_train_epoch_end=True, ### Perhaps excessive
             )

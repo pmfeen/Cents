@@ -108,17 +108,20 @@ def split_dataset(dataset: Dataset, val_split: float = 0.1) -> Tuple[Dataset, Da
 
 
 def encode_context_variables(
-    data: pd.DataFrame, columns_to_encode: List[str], bins: int, numeric_cols: List[str] = None
+    data: pd.DataFrame, columns_to_encode: List[str], bins: int, numeric_cols: List[str] = None, continuous_vars: List[str] = None
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[int, Any]]]:
     """
     Encodes specified columns in the DataFrame either by binning numeric columns
     or by converting categorical/string columns to integer codes. For 'weekday'
     and 'month' columns, encoding follows chronological order.
+    Continuous variables are skipped and kept as-is.
 
     Args:
         data (pd.DataFrame): The input DataFrame containing the data.
         columns_to_encode (List[str]): List of column names to encode.
         bins (int): Number of bins for numeric columns.
+        numeric_cols (List[str], optional): Columns to treat as numeric for binning.
+        continuous_vars (List[str], optional): Columns to keep as continuous (skip encoding).
 
     Returns:
         Tuple[pd.DataFrame, Dict[str, Dict[int, Any]]]:
@@ -127,6 +130,7 @@ def encode_context_variables(
     """
     encoded_data = data.copy()
     mapping: Dict[str, Dict[int, Any]] = {}
+    continuous_vars = continuous_vars or []
 
     # Define the chronological order for weekdays and months
     weekdays_order = [
@@ -154,6 +158,10 @@ def encode_context_variables(
     ]
 
     for col in columns_to_encode:
+        # Skip continuous variables - they should remain as float values
+        if col in continuous_vars:
+            continue
+            
         if numeric_cols and col in numeric_cols:
             # Numeric column: Perform binning
             # Handle NaN values by filling with median before binning

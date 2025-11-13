@@ -7,8 +7,38 @@ from omegaconf import OmegaConf
 ROOT_DIR = Path(__file__).parent.parent
 
 
-def _ckpt_name(dataset: str, model: str, dims: int, *, ext: str = "ckpt") -> str:
-    return f"{dataset}_{model}_dim{dims}.{ext}"
+def _ckpt_name(
+    dataset: str, 
+    model: str, 
+    dims: int, 
+    *, 
+    ext: str = "ckpt",
+    context_module_type: str = None,
+    stats_head_type: str = None
+) -> str:
+    """
+    Generate checkpoint filename with optional context_module_type and stats_head_type.
+    
+    Args:
+        dataset: Dataset name
+        model: Model name
+        dims: Number of dimensions
+        ext: File extension (default: "ckpt")
+        context_module_type: Optional context module type (e.g., "mlp", "sep_mlp")
+        stats_head_type: Optional stats head type (e.g., "mlp")
+    
+    Returns:
+        Formatted checkpoint filename
+    """
+    parts = [dataset, model, f"dim{dims}"]
+    
+    if context_module_type:
+        parts.append(f"ctx{context_module_type}")
+    
+    if stats_head_type:
+        parts.append(f"stats{stats_head_type}")
+    
+    return "_".join(parts) + f".{ext}"
 
 
 def parse_dims_from_name(model_name: str) -> str:

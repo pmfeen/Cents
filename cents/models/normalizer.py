@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
+from omegaconf import ListConfig
+
 
 from cents.datasets.utils import split_timeseries
 from cents.models.base import NormalizerModel
@@ -52,6 +54,39 @@ class MLPStatsHead(nn.Module):
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, out_dim))
         self.net = nn.Sequential(*layers)
+        
+        # Initialize the output layer properly
+        # For log_sigma, initialize to small negative values so exp(log_sigma) starts around 1
+        # This helps with training stability
+        self._initialize_output_layer()
+    
+    def _initialize_output_layer(self):
+        """Initialize the output layer to reasonable starting values."""
+        # Get the last linear layer
+        output_layer = self.net[-1]
+        with torch.no_grad():
+            # Initialize all weights with small values
+            # nn.init.xavier_uniform_(output_layer.weight, gain=1.0)
+            
+            # Initialize all biases to zero first
+            # nn.init.zeros_(output_layer.bias)
+            
+            # For log_sigma outputs (indices 1, 3, 5, ...), initialize bias to small negative
+            # This makes exp(log_sigma) start around 0.1-1.0
+            if self.do_scale:
+                # Pattern: mu, log_sigma, z_min, z_max for each dimension
+                for dim_idx in range(self.time_series_dims):
+                    # log_sigma is at index 1 + 4*dim_idx
+                    log_sigma_idx = 1 + 4 * dim_idx
+                    # Initialize to 3.0: exp(3.0) ≈ 20, closer to typical sigma ~27
+                    output_layer.bias[log_sigma_idx].fill_(3.0)
+            else:
+                # Pattern: mu, log_sigma for each dimension
+                for dim_idx in range(self.time_series_dims):
+                    # log_sigma is at index 1 + 2*dim_idx
+                    log_sigma_idx = 1 + 2 * dim_idx
+                    # Initialize to 3.0: exp(3.0) ≈ 20, closer to typical sigma ~27
+                    output_layer.bias[log_sigma_idx].fill_(3.0)
 
     def forward(self, z: torch.Tensor):
         """
@@ -65,6 +100,7 @@ class MLPStatsHead(nn.Module):
             pred_sigma: Predicted standard deviations, shape (batch_size, time_series_dims).
             pred_z_min: Predicted min z-scores, or None if do_scale=False.
             pred_z_max: Predicted max z-scores, or None if do_scale=False.
+            pred_log_sigma_unclamped: Unclamped log_sigma for loss computation.
         """
         out = self.net(z)
         batch_size = out.size(0)
@@ -80,8 +116,16 @@ class MLPStatsHead(nn.Module):
             pred_log_sigma = out[:, 1, :]
             pred_z_min = None
             pred_z_max = None
-        pred_sigma = torch.exp(pred_log_sigma)
-        return pred_mu, pred_sigma, pred_z_min, pred_z_max
+        
+        # Store unclamped version for loss computation BEFORE clamping
+        # This must be done before any operations that might break the computation graph
+        pred_log_sigma_unclamped = pred_log_sigma
+        
+        # Clamp log_sigma to prevent exp() from producing infinity
+        # exp(88) ≈ 1.6e38 (near float32 max), so clamp to reasonable range
+        pred_log_sigma_clamped = torch.clamp(pred_log_sigma, min=-10.0, max=10.0)
+        pred_sigma = torch.exp(pred_log_sigma_clamped)
+        return pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped
 
 
 class _NormalizerModule(nn.Module):
@@ -125,8 +169,16 @@ class _NormalizerModule(nn.Module):
             cat_vars_dict: Mapping of context variable names to label tensors.
 
         Returns:
-            Tuple of (pred_mu, pred_sigma, pred_z_min, pred_z_max).
+            Tuple of (pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped).
         """
+        # Ensure all tensors in the dict are on the same device and properly connected
+        # This helps with DataLoader multiprocessing issues
+        device = next(self.cond_module.parameters()).device
+        cat_vars_dict = {
+            k: v.to(device, non_blocking=False) if isinstance(v, torch.Tensor) else v
+            for k, v in cat_vars_dict.items()
+        }
+        
         embedding, _ = self.cond_module(cat_vars_dict)
         return self.stats_head(embedding)
 
@@ -158,7 +210,24 @@ class Normalizer(NormalizerModel):
         self.normalizer_training_cfg = normalizer_training_cfg
         self.dataset = dataset
 
-        self.context_vars = list(dataset_cfg.context_vars.keys())
+        # Get continuous variables from config if specified
+        continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
+        # Convert to plain Python list if it's a ListConfig from OmegaConf
+        if continuous_vars:
+            if isinstance(continuous_vars, ListConfig):
+                continuous_vars = [str(v) for v in continuous_vars]  # Ensure strings
+            elif isinstance(continuous_vars, list):
+                continuous_vars = [str(v) for v in continuous_vars]  # Ensure strings
+            else:
+                continuous_vars = [str(continuous_vars)]
+        else:
+            continuous_vars = []
+        
+        # Include both categorical and continuous variables in context_vars
+        # Ensure all are plain Python strings
+        categorical_vars = [str(k) for k in dataset_cfg.context_vars.keys()]
+        self.context_vars = categorical_vars + continuous_vars
+        
         self.time_series_cols = dataset_cfg.time_series_columns[
             : dataset_cfg.time_series_dims
         ]
@@ -169,27 +238,89 @@ class Normalizer(NormalizerModel):
         
         # Use registry to get the context module class
         ContextModuleCls = get_context_module_cls(context_module_type)
-        self.context_module = ContextModuleCls(self.dataset_cfg.context_vars, 256)
+        # Create context module - it will be stored in normalizer_model.cond_module
+        context_module = ContextModuleCls(
+            self.dataset_cfg.context_vars, 
+            256, 
+            continuous_vars=continuous_vars
+        )
 
         # Get stats head type from config
         stats_head_type = getattr(self.dataset_cfg, "stats_head_type", "default")
         
         self.normalizer_model = _NormalizerModule(
-            cond_module=self.context_module,
+            cond_module=context_module,
             hidden_dim=512,
             time_series_dims=self.time_series_dims,
             do_scale=self.do_scale,
             stats_head_type=stats_head_type,
         )
+        self.context_module = self.normalizer_model.cond_module
 
         # Will be populated in setup()
         self.group_stats = {}
+        self._verify_parameters()
+
+    def _verify_parameters(self):
+        """
+        Verify that all parameters including context module are registered.
+        This helps debug parameter counting issues.
+        """
+        all_param_names = [name for name, _ in self.named_parameters()]
+        context_param_names = [name for name in all_param_names if 'cond_module' in name or 'context_module' in name]
+        stats_head_param_names = [name for name in all_param_names if 'stats_head' in name]
+        
+        if not context_param_names:
+            raise RuntimeError(
+                "Context module parameters not found! "
+                "Expected parameters with 'cond_module' in name. "
+                f"Found parameter names: {all_param_names[:10]}..."
+            )
+        
+        print(f"[Normalizer] Found {len(context_param_names)} context module parameters")
+        print(f"[Normalizer] Found {len(stats_head_param_names)} stats head parameters")
+        print(f"[Normalizer] Total trainable parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad):,}")
 
     def setup(self, stage: Optional[str] = None):
         """
         Lightning hook: compute group statistics before training.
         """
         self.group_stats = self._compute_group_stats()
+        
+        # Log initial predictions to check if model is in the right ballpark
+        if stage == "fit" or stage is None:
+            self._log_initial_predictions()
+    
+    def _log_initial_predictions(self):
+        """Log initial model predictions to diagnose initialization issues."""
+        self.eval()
+        with torch.no_grad():
+            # Get a sample batch
+            dataloader = self.train_dataloader()
+            batch = next(iter(dataloader))
+            cat_vars_dict, mu_t, sigma_t, zmin_t, zmax_t = batch
+            
+            # Move to device
+            device = next(self.parameters()).device
+            cat_vars_dict = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in cat_vars_dict.items()
+            }
+            mu_t = mu_t.to(device)
+            sigma_t = sigma_t.to(device)
+            
+            pred_mu, pred_sigma, pred_z_min, pred_z_max, _ = self(cat_vars_dict)
+            
+            print(f"\n[Initial Predictions]")
+            print(f"  Target mu: mean={mu_t.mean().item():.4f}, std={mu_t.std().item():.4f}, range=[{mu_t.min().item():.4f}, {mu_t.max().item():.4f}]")
+            print(f"  Predicted mu: mean={pred_mu.mean().item():.4f}, std={pred_mu.std().item():.4f}, range=[{pred_mu.min().item():.4f}, {pred_mu.max().item():.4f}]")
+            print(f"  Target sigma: mean={sigma_t.mean().item():.4f}, std={sigma_t.std().item():.4f}, range=[{sigma_t.min().item():.4f}, {sigma_t.max().item():.4f}]")
+            print(f"  Predicted sigma: mean={pred_sigma.mean().item():.4f}, std={pred_sigma.std().item():.4f}, range=[{pred_sigma.min().item():.4f}, {pred_sigma.max().item():.4f}]")
+            print(f"  Initial loss_mu: {F.mse_loss(pred_mu, mu_t).item():.6f}")
+            print(f"  Initial loss_sigma: {F.mse_loss(pred_sigma, sigma_t).item():.6f}")
+            print()
+        
+        self.train()
 
     def forward(self, cat_vars_dict: dict):
         """
@@ -199,7 +330,7 @@ class Normalizer(NormalizerModel):
             cat_vars_dict: Mapping of context variable names to label tensors.
 
         Returns:
-            Tuple of (pred_mu, pred_sigma, pred_z_min, pred_z_max).
+            Tuple of (pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped).
         """
         return self.normalizer_model(cat_vars_dict)
 
@@ -215,18 +346,55 @@ class Normalizer(NormalizerModel):
             loss tensor.
         """
         cat_vars_dict, mu_t, sigma_t, zmin_t, zmax_t = batch
-        pred_mu, pred_sigma, pred_z_min, pred_z_max = self(cat_vars_dict)
+        pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped = self(cat_vars_dict)
 
+        # Use standard MSE loss for mu
         loss_mu = F.mse_loss(pred_mu, mu_t)
-        loss_sigma = F.mse_loss(pred_sigma, sigma_t)
+        
+        # Use log-space loss for sigma - this is more numerically stable
+        # and handles scale differences better
+        target_log_sigma = torch.log(sigma_t + 1e-8)  # Add small epsilon to avoid log(0)
+        loss_sigma = F.mse_loss(pred_log_sigma_unclamped, target_log_sigma)
+        
         total_loss = loss_mu + loss_sigma
 
         if self.do_scale:
-            total_loss += F.mse_loss(pred_z_min, zmin_t) + F.mse_loss(
-                pred_z_max, zmax_t
+            if torch.isnan(pred_z_min).any() or torch.isnan(pred_z_max).any():
+                raise ValueError(
+                    f"NaN detected in scale predictions at batch {batch_idx}"
+                )
+            loss_zmin = F.mse_loss(pred_z_min, zmin_t)
+            loss_zmax = F.mse_loss(pred_z_max, zmax_t)
+            total_loss += loss_zmin + loss_zmax
+        else:
+            loss_zmin = torch.tensor(0.0, device=total_loss.device)
+            loss_zmax = torch.tensor(0.0, device=total_loss.device)
+        
+        # Check for NaN in loss
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            raise ValueError(
+                f"NaN/Inf loss detected at batch {batch_idx}. "
+                f"loss_mu: {loss_mu.item():.6f}, loss_sigma: {loss_sigma.item():.6f}"
             )
-
+        
+        # Log individual components to understand what's happening
         self.log("train_loss", total_loss, prog_bar=True)
+        self.log("loss_mu", loss_mu, on_step=True, on_epoch=True, prog_bar=False)
+        self.log("loss_sigma", loss_sigma, on_step=True, on_epoch=True, prog_bar=False)
+        if self.do_scale:
+            self.log("loss_zmin", loss_zmin, on_step=True, on_epoch=True, prog_bar=False)
+            self.log("loss_zmax", loss_zmax, on_step=True, on_epoch=True, prog_bar=False)
+        
+        # Log prediction statistics to monitor if model is learning
+        if batch_idx % 100 == 0:  # Log every 100 batches to avoid spam
+            with torch.no_grad():
+                self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=False)
+                self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=False)
+                self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=False)
+                self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=False)
+                self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=False)
+                self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=False)
+        
         return total_loss
 
     def configure_optimizers(self):
@@ -236,7 +404,47 @@ class Normalizer(NormalizerModel):
         Returns:
             Adam optimizer instance.
         """
-        return torch.optim.Adam(self.parameters(), lr=self.normalizer_training_cfg.lr)
+        optimizer = torch.optim.Adam(
+            self.parameters(), 
+            lr=self.normalizer_training_cfg.lr,
+            betas=(0.9, 0.999),
+            eps=1e-8,
+            weight_decay=0.0
+        )
+        
+        return optimizer
+    
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """
+        Monitor gradients after each training step to diagnose training issues.
+        """
+        if batch_idx % 100 == 0:  # Check every 100 batches
+            total_norm = 0.0
+            param_count = 0
+            zero_grad_count = 0
+            
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    param_norm = param.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+                    param_count += 1
+                    if param_norm.item() < 1e-8:
+                        zero_grad_count += 1
+                else:
+                    # Parameter has no gradient - this might indicate a problem
+                    if 'cond_module' in name or 'stats_head' in name:
+                        # Only warn about important parameters
+                        pass
+            
+            total_norm = total_norm ** (1. / 2)
+            
+            self.log("grad_norm", total_norm, on_step=True, on_epoch=False)
+            self.log("params_with_grad", param_count, on_step=True, on_epoch=False)
+            
+            if total_norm < 1e-6:
+                print(f"[Warning] Very small gradient norm at batch {batch_idx}: {total_norm:.2e}")
+            if zero_grad_count > 0:
+                print(f"[Warning] {zero_grad_count} parameters have near-zero gradients at batch {batch_idx}")
 
     def train_dataloader(self):
         """
@@ -247,8 +455,10 @@ class Normalizer(NormalizerModel):
             ds,
             batch_size=self.normalizer_training_cfg.batch_size,
             shuffle=True,
-            num_workers=23,
-            persistent_workers=True
+            num_workers=8,  # Reduce workers to avoid synchronization issues
+            persistent_workers=True,
+            pin_memory=torch.cuda.is_available(),  # Helps with GPU transfer
+            prefetch_factor=2,  # Reduce prefetch to avoid memory issues
         )
 
     def _compute_group_stats(self) -> dict:
@@ -317,15 +527,18 @@ class Normalizer(NormalizerModel):
             ) in self.group_stats.items()
         ]
 
+        continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
+        
         class _TrainSet(Dataset):
             """
             Adapter Dataset to wrap group_stats tuples for DataLoader.
             """
 
-            def __init__(self, samples, context_vars, do_scale):
+            def __init__(self, samples, context_vars, do_scale, continuous_vars):
                 self.samples = samples
                 self.context_vars = context_vars
                 self.do_scale = do_scale
+                self.continuous_vars = continuous_vars
 
             def __len__(self) -> int:
                 return len(self.samples)
@@ -345,17 +558,20 @@ class Normalizer(NormalizerModel):
                     zmax_t: True max z-score tensor or None.
                 """
                 ctx_tuple, mu_arr, sigma_arr, zmin_arr, zmax_arr = self.samples[idx]
-                cat_vars_dict = {
-                    var_name: torch.tensor(ctx_tuple[i], dtype=torch.long)
-                    for i, var_name in enumerate(self.context_vars)
-                }
+                cat_vars_dict = {}
+                
+                for i, var_name in enumerate(self.context_vars):
+                    if var_name in self.continuous_vars:
+                        cat_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.float32)
+                    else:
+                        cat_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.long)
                 mu_t = torch.from_numpy(mu_arr).float()
                 sigma_t = torch.from_numpy(sigma_arr).float()
                 zmin_t = torch.from_numpy(zmin_arr).float() if self.do_scale else None
                 zmax_t = torch.from_numpy(zmax_arr).float() if self.do_scale else None
                 return cat_vars_dict, mu_t, sigma_t, zmin_t, zmax_t
 
-        return _TrainSet(data_tuples, self.context_vars, self.do_scale)
+        return _TrainSet(data_tuples, self.context_vars, self.do_scale, continuous_vars)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -381,13 +597,16 @@ class Normalizer(NormalizerModel):
         )
         df_out = df.copy()
         self.eval()
+        continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
         with torch.no_grad():
             for i, row in tqdm(df_out.iterrows(), total=len(df_out), desc="Normalizing"):
-                ctx = {
-                    v: torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
-                    for v in self.context_vars
-                }
-                mu, sigma, zmin, zmax = self(ctx)
+                ctx = {}
+                for v in self.context_vars:
+                    if v in continuous_vars:
+                        ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
+                    else:
+                        ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
+                mu, sigma, zmin, zmax, _ = self(ctx)
                 mu, sigma = mu[0].cpu().numpy(), sigma[0].cpu().numpy()
 
                 for d, col in enumerate(self.time_series_cols):
@@ -423,13 +642,16 @@ class Normalizer(NormalizerModel):
 
         df_out = df.copy()
         self.eval()
+        continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
         with torch.no_grad():
             for i, row in tqdm(df_out.iterrows(), total=len(df_out), desc="Inverse normalizing"):
-                ctx = {
-                    v: torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
-                    for v in self.context_vars
-                }
-                mu, sigma, zmin, zmax = self(ctx)
+                ctx = {}
+                for v in self.context_vars:
+                    if v in continuous_vars:
+                        ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
+                    else:
+                        ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
+                mu, sigma, zmin, zmax, _ = self(ctx)
                 mu, sigma = mu[0].cpu().numpy(), sigma[0].cpu().numpy()
 
                 for d, col in enumerate(self.time_series_cols):

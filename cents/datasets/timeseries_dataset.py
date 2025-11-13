@@ -12,6 +12,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 from sklearn.cluster import KMeans
 from torch.utils.data import DataLoader, Dataset
 from omegaconf import ListConfig
+import pickle
 
 from cents.datasets.utils import encode_context_variables
 from cents.models.normalizer import Normalizer
@@ -90,6 +91,23 @@ class TimeSeriesDataset(Dataset):
         if not hasattr(self, "name"):
             self.name = "custom"
 
+        # Add continuous variables to context_vars if specified
+        continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
+        # Convert to plain Python list if it's a ListConfig from OmegaConf
+        if continuous_vars:
+            if isinstance(continuous_vars, ListConfig):
+                continuous_vars = [str(v) for v in continuous_vars]
+            elif isinstance(continuous_vars, list):
+                continuous_vars = [str(v) for v in continuous_vars]
+            else:
+                continuous_vars = [str(continuous_vars)]
+        else:
+            continuous_vars = []
+        
+        # Ensure continuous variables are included in self.context_vars
+        if continuous_vars:
+            self.context_vars = list(self.context_vars) + [v for v in continuous_vars if v not in self.context_vars]
+
         self.normalize = normalize
         self.scale = scale
 
@@ -98,6 +116,10 @@ class TimeSeriesDataset(Dataset):
 
         # Preprocess and optionally encode context
         self.data = self._preprocess_data(data)
+
+        continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
+        if continuous_vars:
+            self._normalize_continuous_vars()
 
         if size is not None:
             self.data = self.data.sample(size)
@@ -111,9 +133,8 @@ class TimeSeriesDataset(Dataset):
             self._init_normalizer()
             cache_path = self._get_normalization_cache_path()
             
-            if cache_path.exists() and is_ddp_subprocess:
-                print(f"[DDP Subprocess] Loading pre-normalized data from cache")
-                import pickle
+            if cache_path.exists():
+                print(f"[{'DDP Subprocess' if is_ddp_subprocess else 'Main Process'}] Loading pre-normalized data from cache")
                 with open(cache_path, 'rb') as f:
                     self.data = pickle.load(f)
             else:
@@ -125,7 +146,6 @@ class TimeSeriesDataset(Dataset):
                 # Save to cache for subprocesses (only main process)
                 if not is_ddp_subprocess:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    import pickle
                     with open(cache_path, 'wb') as f:
                         pickle.dump(self.data, f)
                     print(f"[Main Process] Cached normalized data for subprocesses")
@@ -180,13 +200,27 @@ class TimeSeriesDataset(Dataset):
             Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
                 - timeseries: Tensor of shape (seq_len, dims).
                 - context_vars: Dict of context variable tensors.
+                    Categorical variables are long tensors, continuous variables are float tensors.
         """
         sample = self.data.iloc[idx]
         timeseries = torch.tensor(sample["timeseries"], dtype=torch.float32)
-        context_vars_dict = {
-            var: torch.tensor(sample[var], dtype=torch.long)
-            for var in self.context_vars
-        }
+        
+        continuous_vars = getattr(self.cfg, 'continuous_context_vars', None) or []
+        context_vars_dict = {}
+        for var in self.context_vars:
+            if var in continuous_vars:
+                # Continuous variables: keep as float
+                val = sample[var]
+                # Check for NaN/Inf in the data itself
+                if isinstance(val, (float, int)) and (not isinstance(val, bool) and (np.isnan(val) or np.isinf(val))):
+                    raise ValueError(
+                        f"NaN/Inf detected in continuous variable '{var}' in dataset at index {idx}. "
+                        f"Value: {val}. This should not happen if normalization was done correctly."
+                    )
+                context_vars_dict[var] = torch.tensor(val, dtype=torch.float32)
+            else:
+                # Categorical variables: use long
+                context_vars_dict[var] = torch.tensor(sample[var], dtype=torch.long)
         return timeseries, context_vars_dict
 
     def __getstate__(self):
@@ -212,6 +246,7 @@ class TimeSeriesDataset(Dataset):
             batch_size (int): Batch size.
             shuffle (bool): Whether to shuffle the data.
             num_workers (int): Number of worker processes.
+            persistent_workers (bool): Whether to keep workers alive between epochs.
 
         Returns:
             DataLoader: Configured data loader.
@@ -302,6 +337,7 @@ class TimeSeriesDataset(Dataset):
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """
         Encode and bin numeric or categorical context variables.
+        Continuous variables are kept as-is.
 
         Args:
             data (pd.DataFrame): Input DataFrame.
@@ -309,14 +345,50 @@ class TimeSeriesDataset(Dataset):
         Returns:
             Tuple of encoded DataFrame and mapping codes.
         """
+        continuous_vars = getattr(self.cfg, 'continuous_context_vars', None)
         encoded_data, mapping = encode_context_variables(
             data=data,
             columns_to_encode=self.context_vars,
             bins=self.numeric_context_bins,
             numeric_cols=getattr(self.cfg, 'numeric_cols', None),
+            continuous_vars=continuous_vars,
         )
         
         return encoded_data, mapping
+
+    def _normalize_continuous_vars(self):
+        """
+        Normalize continuous context variables in the dataset using z-score normalization.
+        This is done once during dataset initialization, so models receive pre-normalized values.
+        """
+        continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
+        if not continuous_vars:
+            return
+        
+        # Store stats for potential inverse transform if needed
+        self.continuous_var_stats = {}
+        
+        for var_name in continuous_vars:
+            if var_name in self.data.columns:
+                values = self.data[var_name]
+                # Compute mean and std
+                mean_val = float(values.mean())
+                std_val = float(values.std())
+                
+                # Avoid zero std
+                if std_val < 1e-8:
+                    std_val = 1.0
+                    print(f"[Dataset] Warning: {var_name} has zero std, using std=1.0")
+                
+                # Store stats for reference
+                self.continuous_var_stats[var_name] = {'mean': mean_val, 'std': std_val}
+                
+                # Normalize the values in-place: (x - mean) / std
+                self.data[var_name] = (values - mean_val) / std_val
+                
+                print(f"[Dataset] Normalized {var_name}: mean={mean_val:.4f}, std={std_val:.4f}")
+            else:
+                print(f"[Dataset] Warning: Continuous variable {var_name} not found in data columns")
 
     def _get_context_var_dict(self, data: pd.DataFrame) -> Dict[str, int]:
         """
@@ -482,7 +554,8 @@ class TimeSeriesDataset(Dataset):
         """Get cache file path for rarity features."""
         import hashlib
         # Create a hash based on dataset characteristics for cache key
-        cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{hash(str(sorted(self.context_vars)))}"
+        context_module_type = getattr(self.cfg, "context_module_type", None)
+        cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{str(sorted(self.context_vars))}_{context_module_type or ''}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
         cache_dir = os.path.join(ROOT_DIR, "cache", "rarity")
         os.makedirs(cache_dir, exist_ok=True)
@@ -493,7 +566,9 @@ class TimeSeriesDataset(Dataset):
         import hashlib
         from pathlib import Path
         # Create hash based on dataset + normalizer characteristics
-        cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{self.normalize}_{self.scale}"
+        context_module_type = getattr(self.cfg, "context_module_type", None)
+        stats_head_type = getattr(self.cfg, "stats_head_type", None)
+        cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{self.normalize}_{self.scale}_{context_module_type or ''}_{stats_head_type or ''}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
         cache_dir = Path(ROOT_DIR) / "cache" / "normalized_data"
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -551,8 +626,17 @@ class TimeSeriesDataset(Dataset):
             Path.home() / ".cache" / "cents" / "checkpoints" / self.name / "normalizer"
         )
         normalizer_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get context_module_type and stats_head_type from config
+        context_module_type = getattr(self.cfg, "context_module_type", None)
+        stats_head_type = getattr(self.cfg, "stats_head_type", None)
+        
         cache_path = normalizer_dir / _ckpt_name(
-            self.name, "normalizer", self.time_series_dims
+            self.name, 
+            "normalizer", 
+            self.time_series_dims,
+            context_module_type=context_module_type,
+            stats_head_type=stats_head_type
         )
 
         ncfg = get_normalizer_training_config()
@@ -585,7 +669,7 @@ class TimeSeriesDataset(Dataset):
             devices=ncfg.devices,
             strategy=ncfg.strategy,
             log_every_n_steps=ncfg.log_every_n_steps,
-            logger=False,
+            logger=True,
         )
         trainer.fit(self._normalizer)
         torch.save(self._normalizer.state_dict(), cache_path)

@@ -17,16 +17,18 @@ def main(args) -> None:
     # Skip heavy processing for DDP compatibility
 
     if args.dataset == "pecanstreet":
-        dataset = PecanStreetDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"])
+        dataset = PecanStreetDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}, time_series_dims=1, user_group=all"])
     elif args.dataset == "commercial":
-        dataset = CommercialDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}", "time_series_dims=1", "user_group=all"])
+        dataset = CommercialDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"])
     else:
         raise ValueError(f"Dataset {args.dataset} not supported")
+
+    print("Initialized Dataset")
 
     trainer_overrides = [
         f"trainer.max_epochs={args.epochs}",
         f"trainer.strategy={args.ddp_strategy}",
-        f"trainer.devices={args.devices}",
+        f"trainer.devices=0,1",
         f"trainer.eval_after_training={args.eval_after_training}",
         f"train.accelerator={args.accelerator}",
         "trainer.early_stopping.patience=100",  # Stop if no improvement for 100 epochs
@@ -52,7 +54,7 @@ def main(args) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--devices", type=int, default="auto")
+    parser.add_argument("--devices", type=str, default="auto")
     parser.add_argument("--accelerator", type=str, default="gpu")
     parser.add_argument("--model_name", type=str, default="diffusion_ts")
     parser.add_argument("--cr_loss_weight", type=float, default=0.1)

@@ -10,5 +10,6 @@ seq_len: 8
 user_group: null
 
 numeric_context_bins: 5
-context_vars: {}
+context_vars: {}  # Dict mapping variable names to category counts (for categorical) or placeholders (for continuous)
+continuous_context_vars: []  # Optional: list of variable names that should be kept as continuous (not binned)
 stats_head_type: mlp

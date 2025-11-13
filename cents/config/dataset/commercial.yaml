@@ -18,7 +18,7 @@ numeric_context_bins: 5
 numeric_cols: ["sqft", "yearbuilt"]  # Columns to bin as numeric
 reduce_cardinality: False
 stats_head_type: mlp
-context_module_type: mlp
+context_module_type: sep_mlp
 
 context_vars: # for each desired context variable, add the name and number of categories
   year: 2
@@ -26,7 +26,11 @@ context_vars: # for each desired context variable, add the name and number of ca
   weekday: 7
   site_id: 19
   primaryspaceusage: 16
+  # sqft: 5
+  # yearbuilt: 5
   # sub_primaryspaceusage: 105
-  sqft: 5
-  yearbuilt: 5
+
+continuous_context_vars: # for each desired continuous context variable, add the name and number of bins
+- sqft
+- yearbuilt
 

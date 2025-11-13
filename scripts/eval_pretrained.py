@@ -1,5 +1,6 @@
 import logging
 from datetime import datetime
+from typing import override
 
 # import wandb
 from omegaconf import OmegaConf
@@ -12,7 +13,7 @@ from cents.utils.config_loader import load_yaml
 from pathlib import Path
 import torch
 
-MODEL_KEY = "acgan"
+MODEL_KEY = "diffusion_ts"
 DATASET_OVERRIDES = [
     "max_samples=10000",
     "skip_heavy_processing=True"
@@ -26,14 +27,16 @@ PECAN_OVERRIDES = [
 HOME = Path.home()
 
 def main() -> None:
-    model_ckpt = HOME / f"Cents/cents/outputs/{MODEL_KEY}_pecanstreet_all/2025-10-27_10-09-04/pecanstreet_acgan_dim1.ckpt"
+    
+    model_ckpt = "cents/outputs/diffusion_ts_commercial_all/2025-11-07_15-09-33/commercial_diffusion_ts_dim1_ctxsep_mlp_statsmlp.ckpt"
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     )
     print("Loading dataset...")
-    dataset = PecanStreetDataset(overrides=DATASET_OVERRIDES + PECAN_OVERRIDES)
+    # dataset = PecanStreetDataset(overrides=DATASET_OVERRIDES + PECAN_OVERRIDES)
+    dataset = CommercialDataset(overrides = DATASET_OVERRIDES)
 
-    normalizer_ckpt = HOME / ".cache/cents/checkpoints/pecanstreet/normalizer/pecanstreet_normalizer_dim1.ckpt"
+    normalizer_ckpt = HOME / ".cache/cents/checkpoints/commercial/normalizer/commercial_normalizer_dim1_ctxsep_mlp_statsmlp.ckpt"
     # Build a minimal cfg for evaluator and generator
     eval_cfg = load_yaml("cents/config/evaluator/default.yaml")
     top_cfg = load_yaml("cents/config/config.yaml")
@@ -54,7 +57,7 @@ def main() -> None:
     cfg.eval_disentanglement = eval_cfg.get("eval_disentanglement", True)
     cfg.job_name = eval_cfg.get("job_name", "default_job")
     cfg.save_results = True
-    cfg.save_dir = HOME / f"Cents/cents/outputs/{MODEL_KEY}_pecanstreet_all/2025-10-27_10-09-04/eval"
+    cfg.save_dir = HOME / f"cents/outputs/diffusion_ts_commercial_all/2025-11-07_15-09-33/eval"
     print("Dataset spec set. Setting up DataGenerator...")
 
     # Use the fixed checkpoint with DataGenerator

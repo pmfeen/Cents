@@ -132,11 +132,18 @@ class Diffusion_TS(GenerativeModel):
         if self.loss_type == "l1":
             self.recon_loss_fn = F.l1_loss
         elif self.loss_type == "l2":
-            self.recon_loss_fn = F.mse_loss
+            self.recon_loss_fn = F.mse_loss  # MSE for continuous RVs
         else:
             raise ValueError("Invalid loss type")
 
         self.auxiliary_loss = nn.CrossEntropyLoss()
+        
+        # Get continuous variables from config to distinguish them in loss computation
+        self.continuous_context_vars = getattr(cfg.dataset, "continuous_context_vars", None) or []
+        if isinstance(self.continuous_context_vars, (list, tuple)):
+            self.continuous_context_vars = set(self.continuous_context_vars)
+        else:
+            self.continuous_context_vars = set([self.continuous_context_vars]) if self.continuous_context_vars else set()
 
     def predict_noise_from_start(
         self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor
@@ -215,17 +222,66 @@ class Diffusion_TS(GenerativeModel):
         b = x.shape[0]
         t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
         embedding, cond_classification_logits = self.context_module(context_vars)
+        
+        # Check embedding for NaN/Inf and extreme values
+        if embedding.isnan().any() or embedding.isinf().any():
+            raise ValueError(
+                f"NaN/Inf detected in embedding from context module. "
+                f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}"
+            )
+        
+        # Clamp extreme values to prevent numerical instability in transformer
+        # Don't fully normalize as that would change the learned embedding scale
+        # Just clip extreme outliers that could cause issues in attention/Fourier operations
+        # embedding_clamped = torch.clamp(embedding, min=-50.0, max=50.0)
+        
+        # # Log if clamping occurred (for debugging)
+        # if (embedding != embedding_clamped).any():
+        #     n_clamped = (embedding != embedding_clamped).sum().item()
+        #     print(f"[Warning] Clamped {n_clamped} embedding values. "
+        #           f"Original range: [{embedding.min():.4f}, {embedding.max():.4f}], "
+        #           f"Clamped range: [{embedding_clamped.min():.4f}, {embedding_clamped.max():.4f}]")
+        
+        # embedding_normalized = embedding_clamped
+        
         noise = torch.randn_like(x)
         x_noisy = (
             self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * x
             + self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * noise
         )
-        c = torch.cat(
-            [x_noisy, embedding.unsqueeze(1).repeat(1, self.seq_len, 1)],
-            dim=-1,
-        )
+
+        if x_noisy.isnan().any(): 
+            raise ValueError("NaN detected in x_noisy")
+        
+        # Use normalized embedding for concatenation
+        embedding_expanded = embedding.unsqueeze(1).repeat(1, self.seq_len, 1)
+        c = torch.cat([x_noisy, embedding_expanded], dim=-1)
+
+        if c.isnan().any() or c.isinf().any():
+            raise ValueError(
+                f"NaN/Inf detected in concatenated input 'c'. "
+                f"x_noisy stats: mean={x_noisy.mean():.4f}, std={x_noisy.std():.4f}, "
+                f"min={x_noisy.min():.4f}, max={x_noisy.max():.4f}. "
+                f"embedding stats: mean={embedding.mean():.4f}, "
+                f"std={embedding.std():.4f}, min={embedding.min():.4f}, "
+                f"max={embedding.max():.4f}"
+            )
+
+        if t.isnan().any():
+            raise ValueError("NaN detected in timestep 't'")
+
         trend, season = self.model(c, t, padding_masks=None)
+        if trend.isnan().any():
+            print("trend")
+
+        if season.isnan().any():
+            print("season")
         x_recon = self.fc(trend + season)
+        if x_recon.isnan().any():
+            print("X RECON")
+        if x.isnan().any():
+            print("x")
+        # print("REC LOSS", x_recon, x)
         rec_loss = self.recon_loss_fn(x_recon, x)
         return rec_loss, cond_classification_logits
 
@@ -242,11 +298,28 @@ class Diffusion_TS(GenerativeModel):
         """
         ts_batch, cond_batch = batch
         rec_loss, cond_class_logits = self(ts_batch, cond_batch)
+        
+        # Check for NaN in reconstruction loss early
+        if torch.isnan(rec_loss) or torch.isinf(rec_loss):
+            # print(rec_loss)
+            # print(ts_batch, cond_batch)
+            raise ValueError(
+                f"NaN/Inf detected in rec_loss at batch {batch_idx}. "
+            )
+        
         cond_loss = 0.0
 
-        for var_name, logits in cond_class_logits.items():
+        for var_name, outputs in cond_class_logits.items():
             labels = cond_batch[var_name]
-            cond_loss += self.auxiliary_loss(logits, labels)
+            
+            if var_name in self.continuous_context_vars:
+                # Continuous variable: use MSE loss
+                # outputs is shape (batch_size,), labels is shape (batch_size,)
+                cond_loss += F.mse_loss(outputs, labels.float())
+            else:
+                # Categorical variable: use Cross-Entropy loss
+                # outputs (logits) is shape (batch_size, num_categories), labels is shape (batch_size,)
+                cond_loss += self.auxiliary_loss(outputs, labels)
 
         h, _ = self.context_module(cond_batch)
         tc_term = (
@@ -258,6 +331,13 @@ class Diffusion_TS(GenerativeModel):
         total_loss = (
             rec_loss + self.context_reconstruction_loss_weight * cond_loss + tc_term
         )
+        
+        # Check for NaN in total loss
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            raise ValueError(
+                f"NaN/Inf detected in total_loss at batch {batch_idx}. "
+                f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss:.6f}, tc_term: {tc_term.item():.6f}"
+            )
         self.log_dict(
             {
                 "train_loss": total_loss,
