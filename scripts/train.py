@@ -28,7 +28,7 @@ def main(args) -> None:
     trainer_overrides = [
         f"trainer.max_epochs={args.epochs}",
         f"trainer.strategy={args.ddp_strategy}",
-        f"trainer.devices=0,1",
+        f"trainer.devices={args.devices}",
         f"trainer.eval_after_training={args.eval_after_training}",
         f"train.accelerator={args.accelerator}",
         "trainer.early_stopping.patience=100",  # Stop if no improvement for 100 epochs

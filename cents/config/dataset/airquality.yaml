@@ -1,0 +1,32 @@
+name: airquality
+geography: null
+normalize: True
+scale: True
+use_learned_normalizer: True
+threshold: 8
+seq_len: 24
+shuffle: True
+skip_heavy_processing: False  # Skip rarity computation (for faster loading/DDP)
+max_samples: null  # Limit dataset size (null = use all data)
+path: "./data/airquality"
+target_time_series_columns: "PM2.5"
+context_time_series_columns: ["TEMP", "DEWP", "PRES", "RAIN", "WSPM", "wd"]
+data_columns: ["id", "PM2.5", "timestamp"]
+metadata_columns: ["station"]
+reduce_cardinality: False
+stats_head_type: mlp
+context_module_type: sep_mlp
+
+context_vars: # for each desired context variable, add the name and number of categories
+  year: 2
+  month: 12
+  weekday: 7
+
+time_series_context_vars: # for each desired continuous context variable, add the name and number of bins
+- TEMP
+- DEWP
+- PRES
+- RAIN
+- WSPM
+- wd
+
