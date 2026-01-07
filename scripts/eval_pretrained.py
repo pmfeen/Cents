@@ -10,9 +10,11 @@ from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
 from cents.eval.eval import Evaluator
 from cents.utils.config_loader import load_yaml
+from cents.utils.utils import set_context_config_path
 from pathlib import Path
 import torch
 import os
+import argparse
 
 MODEL_KEY = "diffusion_ts"
 DATASET_OVERRIDES = [
@@ -27,7 +29,10 @@ PECAN_OVERRIDES = [
 
 HOME = Path.home()
 
-def main() -> None:
+def main(args) -> None:
+    # Set custom context config path if provided
+    if args.context_config_path:
+        set_context_config_path(args.context_config_path)
     
     model_ckpt = "cents/outputs/diffusion_ts_commercial_all/2025-11-13_19-50-40/commercial_diffusion_ts_dim1_ctxsep_mlp_statsmlp.ckpt"
     logging.basicConfig(
@@ -83,4 +88,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--context-config-path", type=str, default=None,
+                        help="Path to custom context config YAML file (optional)")
+    args = parser.parse_args()
+    main(args)

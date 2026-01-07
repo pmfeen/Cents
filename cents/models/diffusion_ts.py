@@ -139,7 +139,7 @@ class Diffusion_TS(GenerativeModel):
         self.auxiliary_loss = nn.CrossEntropyLoss()
         
         # Get continuous variables from config to distinguish them in loss computation
-        self.continuous_context_vars = getattr(cfg.dataset, "continuous_context_vars", None) or []
+        self.continuous_context_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "continuous"]
 
     def predict_noise_from_start(
         self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor

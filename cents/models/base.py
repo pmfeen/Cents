@@ -7,6 +7,7 @@ from omegaconf import DictConfig
 
 from cents.models.context import MLPContextModule, SepMLPContextModule  # Import to trigger registration
 from cents.models.context_registry import get_context_module_cls
+from cents.utils.utils import get_context_config
 
 
 class BaseModel(pl.LightningModule, ABC):
@@ -39,16 +40,17 @@ class BaseModel(pl.LightningModule, ABC):
 
             if hasattr(cfg.dataset, "context_vars") and cfg.dataset.context_vars:
                 emb_dim = getattr(cfg.model, "cond_emb_dim", 256)
-                context_module_type = getattr(cfg.model, "context_module_type", "default")
+                # Get context module type from context config
+                context_cfg = get_context_config()
+                context_module_type = context_cfg.static_context.type
                 
                 # Get continuous variables from config if specified
-                continuous_vars = getattr(cfg.dataset, "continuous_context_vars", None)
+                # continuous_vars = getattr(cfg.dataset, "continuous_context_vars", None)
                 # Use registry to get the context module class
                 ContextModuleCls = get_context_module_cls(context_module_type)
                 self.context_module = ContextModuleCls(
                     cfg.dataset.context_vars, 
                     emb_dim, 
-                    continuous_vars=continuous_vars
                 )
             else:
                 self.context_module = None

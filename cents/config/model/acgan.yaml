@@ -2,7 +2,6 @@ _target_: generator.gan.acgan.ACGAN
 name: acgan
 noise_dim: 256
 cond_emb_dim: 16
-context_module_type: sep_mlp
 include_auxiliary_losses: True
 context_reconstruction_loss_weight: 0.1
 tc_loss_weight: 0

@@ -62,8 +62,6 @@ class PecanStreetDataset(TimeSeriesDataset):
         self.threshold = (-1 * int(cfg.threshold), int(cfg.threshold))
         self.time_series_dims = cfg.time_series_dims
 
-        self.cfg.time_series_columns = ["grid", "solar"]
-
         self.include_generation = self.time_series_dims > 1
 
         if self.time_series_dims > 1 and self.cfg.user_group in {"non_pv_users", "all"}:

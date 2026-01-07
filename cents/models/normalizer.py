@@ -16,6 +16,7 @@ from cents.models.context import MLPContextModule, SepMLPContextModule  # Import
 from cents.models.context_registry import get_context_module_cls
 from cents.models.stats_head_registry import register_stats_head, get_stats_head_cls
 from cents.models.registry import register_model
+from cents.utils.utils import get_context_config
 
 
 @register_stats_head("default", "mlp")
@@ -211,21 +212,8 @@ class Normalizer(NormalizerModel):
         self.dataset = dataset
 
         # Get continuous variables from config if specified
-        continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
-        # Convert to plain Python list if it's a ListConfig from OmegaConf
-        if continuous_vars:
-            if isinstance(continuous_vars, ListConfig):
-                continuous_vars = [str(v) for v in continuous_vars]  # Ensure strings
-            elif isinstance(continuous_vars, list):
-                continuous_vars = [str(v) for v in continuous_vars]  # Ensure strings
-            else:
-                continuous_vars = [str(continuous_vars)]
-        else:
-            continuous_vars = []
-        
-        # Include both categorical and continuous variables in context_vars
-        # Ensure all are plain Python strings
-        categorical_vars = [str(k) for k in dataset_cfg.context_vars.keys()]
+        continuous_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "continuous"]
+        categorical_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "categorical"]
         self.context_vars = categorical_vars + continuous_vars
         
         self.time_series_cols = dataset_cfg.time_series_columns[
@@ -234,7 +222,10 @@ class Normalizer(NormalizerModel):
         self.time_series_dims = dataset_cfg.time_series_dims
         self.do_scale = dataset_cfg.scale
 
-        context_module_type = getattr(self.dataset_cfg, "context_module_type", "default")
+        # Get context config
+        context_cfg = get_context_config()
+        context_module_type = context_cfg.dynamic_context.type
+        stats_head_type = context_cfg.normalizer.stats_head_type
         
         # Use registry to get the context module class
         ContextModuleCls = get_context_module_cls(context_module_type)
@@ -242,11 +233,7 @@ class Normalizer(NormalizerModel):
         context_module = ContextModuleCls(
             self.dataset_cfg.context_vars, 
             256, 
-            continuous_vars=continuous_vars
         )
-
-        # Get stats head type from config
-        stats_head_type = getattr(self.dataset_cfg, "stats_head_type", "default")
         
         self.normalizer_model = _NormalizerModule(
             cond_module=context_module,
@@ -598,6 +585,10 @@ class Normalizer(NormalizerModel):
         df_out = df.copy()
         self.eval()
         continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
+        
+        # Get categorical time series from dataset if available
+        categorical_ts = getattr(self.dataset, 'categorical_time_series', {})
+        
         with torch.no_grad():
             for i, row in tqdm(df_out.iterrows(), total=len(df_out), desc="Normalizing"):
                 ctx = {}
@@ -611,6 +602,14 @@ class Normalizer(NormalizerModel):
 
                 for d, col in enumerate(self.time_series_cols):
                     arr = np.asarray(row[col], dtype=np.float32)
+                    
+                    # Skip normalization for categorical time series
+                    if col in categorical_ts:
+                        # Keep as integers, just ensure proper dtype
+                        df_out.at[i, col] = arr.astype(np.int32)
+                        continue
+                    
+                    # Normalize numeric time series
                     z = (arr - mu[d]) / (sigma[d] + 1e-8)
                     if self.do_scale:
                         zmin_, zmax_ = zmin[0, d].item(), zmax[0, d].item()

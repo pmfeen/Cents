@@ -13,21 +13,16 @@ path: "./data/pecanstreet/csv"
 time_series_columns: ["grid", "solar"]
 data_columns: ["dataid","local_15min","car1","grid","solar"]
 metadata_columns: ["dataid","building_type","solar","car1","city","state","total_square_footage","house_construction_year"]
-numeric_cols: ["total_square_footage", "house_construction_year"]
 user_group: all # non_pv_users, all, pv_users
 numeric_context_bins: 5
-stats_head_type: mlp
-context_module_type: sep_mlp
 
-context_vars: # for each desired context variable, add the name and number of categories
-  month: 12
-  weekday: 7
-  building_type: 3
-  has_solar: 2 # note that the metadata csv file column name is 'solar', which is renamed to avoid conflicts with the 'solar' column in the data csv.
-  car1: 2
-  city: 7
-  state: 3
-
-continuous_context_vars:
-- total_square_footage
-- house_construction_year
+context_vars:
+  month: ["categorical", 12]
+  weekday: ["categorical", 7]
+  building_type: ["categorical", 3]
+  has_solar: ["categorical", 2]
+  car1: ["categorical", 2]
+  city: ["categorical", 7]
+  state: ["categorical", 3]
+  total_square_footage: ["continuous", None]
+  house_construction_year: ["continuous", None]

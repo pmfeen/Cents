@@ -3,7 +3,9 @@ import pandas as pd
 
 from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
+from cents.datasets.airquality import AirQualityDataset
 from cents.trainer import Trainer
+from cents.utils.utils import set_context_config_path
 from pytorch_lightning.callbacks import EarlyStopping
 import warnings
 import argparse
@@ -14,12 +16,19 @@ def main(args) -> None:
     MODEL_NAME = args.model_name
     CR_LOSS_WEIGHT = args.cr_loss_weight
     TC_LOSS_WEIGHT = args.tc_loss_weight
+    
+    # Set custom context config path if provided
+    if args.context_config_path:
+        set_context_config_path(args.context_config_path)
+    
     # Skip heavy processing for DDP compatibility
 
     if args.dataset == "pecanstreet":
         dataset = PecanStreetDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}, time_series_dims=1, user_group=all"])
     elif args.dataset == "commercial":
         dataset = CommercialDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"])
+    elif args.dataset == "airquality":
+        dataset = AirQualityDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"])
     else:
         raise ValueError(f"Dataset {args.dataset} not supported")
 
@@ -69,6 +78,8 @@ if __name__ == "__main__":
     parser.add_argument("--skip_heavy_processing", type=bool, default=True)
     parser.add_argument("--ddp-strategy", type=str, default="ddp_find_unused_parameters_false")
     parser.add_argument("--enable_checkpointing", type=bool, default=True)
+    parser.add_argument("--context-config-path", type=str, default=None, 
+                        help="Path to custom context config YAML file (optional)")
 
     args = parser.parse_args()
     main(args)

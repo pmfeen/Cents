@@ -17,7 +17,7 @@ import pickle
 from cents.datasets.utils import encode_context_variables
 from cents.models.normalizer import Normalizer
 from cents.utils.config_loader import load_yaml, apply_overrides
-from cents.utils.utils import _ckpt_name, get_normalizer_training_config
+from cents.utils.utils import _ckpt_name, get_normalizer_training_config, get_context_config
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -54,6 +54,7 @@ class TimeSeriesDataset(Dataset):
         overrides: Dict[str, Any] = {},
         skip_heavy_processing: bool = False,
         size: int = None,
+        categorical_time_series: Dict[str, int] = None,
     ):
         # Initialize basic attributes
         # Handle OmegaConf ListConfig objects
@@ -110,6 +111,9 @@ class TimeSeriesDataset(Dataset):
 
         self.normalize = normalize
         self.scale = scale
+        
+        # Store categorical time series info
+        self.categorical_time_series = categorical_time_series or {}
 
         if self.scale:
             assert self.normalize, "Normalization must be enabled if scaling is enabled"
@@ -317,6 +321,12 @@ class TimeSeriesDataset(Dataset):
                         raise ValueError("Incorrect array shape.")
                 else:
                     raise ValueError("Array must have 2 dims.")
+        
+        # For categorical time series, ensure they remain as integers
+        for col in self.time_series_column_names:
+            if col in self.categorical_time_series:
+                df[col] = df[col].apply(lambda x: x.astype(np.int32))
+        
         df["timeseries"] = df.apply(
             lambda r: np.hstack([r[c] for c in self.time_series_column_names]), axis=1
         )
@@ -563,7 +573,8 @@ class TimeSeriesDataset(Dataset):
         """Get cache file path for rarity features."""
         import hashlib
         # Create a hash based on dataset characteristics for cache key
-        context_module_type = getattr(self.cfg, "context_module_type", None)
+        context_cfg = get_context_config()
+        context_module_type = context_cfg.static_context.type
         cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{str(sorted(self.context_vars))}_{context_module_type or ''}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
         cache_dir = os.path.join(ROOT_DIR, "cache", "rarity")
@@ -575,8 +586,9 @@ class TimeSeriesDataset(Dataset):
         import hashlib
         from pathlib import Path
         # Create hash based on dataset + normalizer characteristics
-        context_module_type = getattr(self.cfg, "context_module_type", None)
-        stats_head_type = getattr(self.cfg, "stats_head_type", None)
+        context_cfg = get_context_config()
+        context_module_type = context_cfg.dynamic_context.type
+        stats_head_type = context_cfg.normalizer.stats_head_type
         cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{self.normalize}_{self.scale}_{context_module_type or ''}_{stats_head_type or ''}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
         cache_dir = Path(ROOT_DIR) / "cache" / "normalized_data"
@@ -636,9 +648,10 @@ class TimeSeriesDataset(Dataset):
         )
         normalizer_dir.mkdir(parents=True, exist_ok=True)
         
-        # Get context_module_type and stats_head_type from config
-        context_module_type = getattr(self.cfg, "context_module_type", None)
-        stats_head_type = getattr(self.cfg, "stats_head_type", None)
+        # Get context_module_type and stats_head_type from context config
+        context_cfg = get_context_config()
+        context_module_type = context_cfg.dynamic_context.type
+        stats_head_type = context_cfg.normalizer.stats_head_type
         
         cache_path = normalizer_dir / _ckpt_name(
             self.name, 

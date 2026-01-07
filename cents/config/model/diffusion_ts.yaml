@@ -4,7 +4,6 @@ context_reconstruction_loss_weight: 0.1
 tc_loss_weight: 0
 noise_dim: 256
 cond_emb_dim: 16
-context_module_type: sep_mlp
 n_layer_enc: 4
 n_layer_dec: 5
 d_model: 128

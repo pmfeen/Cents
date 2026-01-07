@@ -66,6 +66,45 @@ def get_normalizer_training_config():
     )
     return OmegaConf.load(config_path)
 
+_context_config_path = None
+
+
+def set_context_config_path(path: str):
+    """
+    Set a custom path for the context configuration file.
+    This path will be used by get_context_config() instead of the default.
+    
+    Args:
+        path: Path to the context config YAML file. If None, resets to default.
+    """
+    global _context_config_path
+    _context_config_path = path
+
+def get_context_config(path: str = None):
+    """
+    Load the context configuration from config/context/default.yaml or a custom path.
+    
+    Args:
+        path: Optional path to a custom context config file. If None, uses the path
+              set by set_context_config_path() or defaults to config/context/default.yaml.
+    
+    Returns:
+        OmegaConf config with static_context, normalizer, and dynamic_context sections.
+    """
+    if path is not None:
+        config_path = path
+    elif _context_config_path is not None:
+        print(f"Using custom context config path: {_context_config_path}")
+        config_path = _context_config_path
+    else:
+        config_path = os.path.join(
+            ROOT_DIR,
+            "config",
+            "context",
+            "default.yaml",
+        )
+    return OmegaConf.load(config_path)
+
 
 def get_default_trainer_config():
     config_path = os.path.join(

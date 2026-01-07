@@ -201,16 +201,15 @@ class Trainer:
             f"dim{self.cfg.dataset.time_series_dims}"
         ]
         
-        # Add context_module_type if available (from model or dataset config)
-        context_module_type = getattr(
-            self.cfg.model, "context_module_type", 
-            getattr(self.cfg.dataset, "context_module_type", None)
-        )
+        # Add context_module_type from context config
+        from cents.utils.utils import get_context_config
+        context_cfg = get_context_config()
+        context_module_type = context_cfg.static_context.type
         if context_module_type:
             filename_parts.append(f"ctx{context_module_type}")
         
-        # Add stats_head_type if available (typically in dataset config for normalizer)
-        stats_head_type = getattr(self.cfg.dataset, "stats_head_type", None)
+        # Add stats_head_type from context config
+        stats_head_type = context_cfg.normalizer.stats_head_type
         if stats_head_type:
             filename_parts.append(f"stats{stats_head_type}")
         

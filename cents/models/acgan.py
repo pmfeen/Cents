@@ -198,12 +198,17 @@ class ACGAN(GenerativeModel):
         #     cfg.dataset.context_vars, cfg.model.cond_emb_dim
         # )
         continuous_vars = getattr(cfg.dataset, "continuous_context_vars", None) or []
+        # Get context module type from context config
+        from cents.utils.utils import get_context_config
+        context_cfg = get_context_config()
+        context_module_type = context_cfg.static_context.type
+        
         self.generator = Generator(
             noise_dim=cfg.model.noise_dim,
             embedding_dim=cfg.model.cond_emb_dim,
             final_window_length=cfg.dataset.seq_len,
             time_series_dims=cfg.dataset.time_series_dims,
-            context_module_type=cfg.model.context_module_type,
+            context_module_type=context_module_type,
             context_vars=cfg.dataset.context_vars,
             continuous_vars=continuous_vars,
         )

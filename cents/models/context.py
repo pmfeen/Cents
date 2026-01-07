@@ -96,8 +96,6 @@ class SepMLPContextModule(BaseContextModule):
         embedding_dim: int, 
         init_depth: int = 1, 
         mixing_depth: int = 1, 
-        continuous_vars: Optional[list[str]] = None,
-        continuous_var_stats: Optional[dict[str, dict[str, float]]] = None  # Deprecated, kept for backward compatibility
     ) -> None:
         """
         Initialize SepMLPContextModule.
@@ -112,9 +110,10 @@ class SepMLPContextModule(BaseContextModule):
         super().__init__()
 
         self.embedding_dim = embedding_dim
-        self.continuous_vars = continuous_vars or []
-        self.categorical_vars = {k: v for k, v in context_vars.items() if k not in self.continuous_vars}
-
+        self.continuous_vars = [k for k, v in context_vars.items() if v[0] == "continuous"]
+        self.categorical_vars = {k: v[1] for k, v in context_vars.items() if k not in self.continuous_vars}
+        print(self.continuous_vars, "CONT VARS")
+        print(self.categorical_vars, "CAT VARS")
         self.context_embeddings = nn.ModuleDict(
             {
                 name: nn.Embedding(num_categories, embedding_dim)
