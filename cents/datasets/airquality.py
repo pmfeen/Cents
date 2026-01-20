@@ -17,7 +17,8 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class AirQualityDataset(TimeSeriesDataset):
     def __init__(self, cfg: DictConfig = None,
-                overrides: Optional[List[str]] = None):
+                overrides: Optional[List[str]] = None,
+                force_retrain_normalizer: bool = False):
         """
         Initializes the AirQuality Dataset. Available at:
         https://doi.org/10.24432/C5RK5G.
@@ -61,6 +62,7 @@ class AirQualityDataset(TimeSeriesDataset):
             skip_heavy_processing=cfg.get('skip_heavy_processing', False),
             size=cfg.get('max_samples', None),
             categorical_time_series=self.categorical_time_series,
+            force_retrain_normalizer=force_retrain_normalizer,
         )
 
     def _load_data(self):

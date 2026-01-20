@@ -119,9 +119,6 @@ class SepMLPContextModule(BaseContextModule):
             }
         )
 
-        print(self.continuous_vars, "CONT VARS")
-        print(self.categorical_vars, "CAT VARS")
-
         # For continuous variables, use a simple linear projection
         self.continuous_projections = nn.ModuleDict(
             {
@@ -172,8 +169,6 @@ class SepMLPContextModule(BaseContextModule):
         )
 
     def forward(self, context_vars):
-        #print(self.continuous_vars, "CONT VARS")
-        #print(context_vars, "VARS")
         encodings = {}
         
         # Process categorical variables (only those present in context_vars)

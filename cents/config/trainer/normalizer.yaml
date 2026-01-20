@@ -11,6 +11,7 @@ lr: 1e-5
 gradient_clip_val: 1.0
 save_cycle: 5000
 eval_after_training: False
+loss_type: gaussian_nll  # Options: "mse" or "gaussian_nll"
 
 checkpoint:
   save_last: False

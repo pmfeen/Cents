@@ -55,6 +55,7 @@ class TimeSeriesDataset(Dataset):
         skip_heavy_processing: bool = False,
         size: int = None,
         categorical_time_series: Dict[str, int] = None,
+        force_retrain_normalizer: bool = False,
     ):
         # Initialize basic attributes
         # Handle OmegaConf ListConfig objects
@@ -97,6 +98,7 @@ class TimeSeriesDataset(Dataset):
 
         self.normalize = normalize
         self.scale = scale
+        self.force_retrain_normalizer = force_retrain_normalizer
         
         # Store categorical time series info
         self.categorical_time_series = categorical_time_series or {}
@@ -658,8 +660,8 @@ class TimeSeriesDataset(Dataset):
             dataset=self,
         )
 
-        # attempt to load existing state dict
-        if cache_path.exists():
+        # attempt to load existing state dict (unless force_retrain_normalizer is True)
+        if cache_path.exists() and not self.force_retrain_normalizer:
             try:
                 state = torch.load(cache_path, map_location="cpu")
                 sd = state.get("state_dict", state)
@@ -672,6 +674,8 @@ class TimeSeriesDataset(Dataset):
                     cache_path.unlink()
                 except OSError:
                     pass
+        elif self.force_retrain_normalizer and cache_path.exists():
+            print(f"[Cents] Force retrain enabled, ignoring cached normalizer at {cache_path}")
 
         # train and cache a single state dict
         print("[Cents] Training normalizer…")

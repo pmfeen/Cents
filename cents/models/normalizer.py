@@ -299,6 +299,9 @@ class Normalizer(NormalizerModel):
         self.dynamic_module_type = self.dataset.dynamic_module_type
         self.stats_head_type = self.dataset.stats_head_type
         
+        # Get loss type from config (default to "mse")
+        self.loss_type = getattr(self.normalizer_training_cfg, "loss_type", "mse")
+        
         # Create static context module (for categorical + continuous)
         static_context_module = None
         if self.static_context_vars:
@@ -420,6 +423,60 @@ class Normalizer(NormalizerModel):
         """
         return self.normalizer_model(cat_vars_dict)
 
+    def _compute_loss_mse(self, pred_mu, pred_sigma, pred_log_sigma_unclamped, mu_t, sigma_t):
+        """
+        Compute MSE loss for mu and sigma.
+        
+        Args:
+            pred_mu: Predicted means
+            pred_sigma: Predicted standard deviations
+            pred_log_sigma_unclamped: Unclamped log sigma predictions
+            mu_t: Target means
+            sigma_t: Target standard deviations
+            
+        Returns:
+            loss_mu, loss_sigma
+        """
+        # Use standard MSE loss for mu
+        loss_mu = F.mse_loss(pred_mu, mu_t)
+        
+        # Use log-space loss for sigma - this is more numerically stable
+        # and handles scale differences better
+        target_log_sigma = torch.log(sigma_t + 1e-8)  # Add small epsilon to avoid log(0)
+        loss_sigma = F.mse_loss(pred_log_sigma_unclamped, target_log_sigma)
+        
+        return loss_mu, loss_sigma
+    
+    def _compute_loss_gaussian_nll(self, pred_mu, pred_sigma, mu_t, sigma_t):
+        """
+        Compute Gaussian Negative Log Likelihood loss.
+        
+        Treats target mu_t as observations from N(pred_mu, pred_sigma^2).
+        For sigma, still uses log-space MSE since it's a scale parameter.
+        
+        Args:
+            pred_mu: Predicted means
+            pred_sigma: Predicted standard deviations
+            mu_t: Target means (treated as observations)
+            sigma_t: Target standard deviations
+            
+        Returns:
+            loss_mu, loss_sigma
+        """
+        # Use Gaussian NLL for mu: treat mu_t as observations from N(pred_mu, pred_sigma^2)
+        # GaussianNLLLoss expects: input (mean), target (observations), var (variance)
+        # We need to ensure variance is positive and not too small
+        pred_var = torch.clamp(pred_sigma ** 2, min=1e-6)
+        gaussian_nll = nn.GaussianNLLLoss(reduction='mean')
+        loss_mu = gaussian_nll(pred_mu, mu_t, pred_var)
+        
+        # For sigma, still use log-space MSE (sigma is a scale parameter, not a location)
+        pred_log_sigma = torch.log(pred_sigma + 1e-8)
+        target_log_sigma = torch.log(sigma_t + 1e-8)
+        loss_sigma = F.mse_loss(pred_log_sigma, target_log_sigma)
+        
+        return loss_mu, loss_sigma
+
     def training_step(self, batch, batch_idx: int):
         """
         Training step: regress predicted stats against true group stats.
@@ -434,13 +491,20 @@ class Normalizer(NormalizerModel):
         context_vars_dict, mu_t, sigma_t, zmin_t, zmax_t = batch
         pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped = self(context_vars_dict)
 
-        # Use standard MSE loss for mu
-        loss_mu = F.mse_loss(pred_mu, mu_t)
-        
-        # Use log-space loss for sigma - this is more numerically stable
-        # and handles scale differences better
-        target_log_sigma = torch.log(sigma_t + 1e-8)  # Add small epsilon to avoid log(0)
-        loss_sigma = F.mse_loss(pred_log_sigma_unclamped, target_log_sigma)
+        # Compute loss based on loss_type
+        if self.loss_type == "mse":
+            loss_mu, loss_sigma = self._compute_loss_mse(
+                pred_mu, pred_sigma, pred_log_sigma_unclamped, mu_t, sigma_t
+            )
+        elif self.loss_type == "gaussian_nll":
+            loss_mu, loss_sigma = self._compute_loss_gaussian_nll(
+                pred_mu, pred_sigma, mu_t, sigma_t
+            )
+        else:
+            raise ValueError(
+                f"Unknown loss_type: {self.loss_type}. "
+                f"Supported types: 'mse', 'gaussian_nll'"
+            )
         
         total_loss = loss_mu + loss_sigma
 

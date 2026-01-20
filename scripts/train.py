@@ -28,11 +28,20 @@ def main(args) -> None:
     # Skip heavy processing for DDP compatibility
 
     if args.dataset == "pecanstreet":
-        dataset = PecanStreetDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}, time_series_dims=1, user_group=all"])
+        dataset = PecanStreetDataset(
+            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}, time_series_dims=1, user_group=all"],
+            force_retrain_normalizer=args.force_retrain_normalizer
+        )
     elif args.dataset == "commercial":
-        dataset = CommercialDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"])
+        dataset = CommercialDataset(
+            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
+            force_retrain_normalizer=args.force_retrain_normalizer
+        )
     elif args.dataset == "airquality":
-        dataset = AirQualityDataset(overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"])
+        dataset = AirQualityDataset(
+            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
+            force_retrain_normalizer=args.force_retrain_normalizer
+        )
     else:
         raise ValueError(f"Dataset {args.dataset} not supported")
 
@@ -86,6 +95,8 @@ if __name__ == "__main__":
                         help="Path to custom context config YAML file (optional)")
     parser.add_argument("--context-overrides", type=str, nargs="*", default=[],
                         help="Override context config values (e.g., 'static_context.type=mlp' 'dynamic_context.type=cnn')")
+    parser.add_argument("--force-retrain-normalizer", type=bool, default=False,
+                        help="Force retraining of normalizer even if cached version exists")
 
     args = parser.parse_args()
     main(args)
