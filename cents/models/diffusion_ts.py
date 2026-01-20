@@ -140,6 +140,7 @@ class Diffusion_TS(GenerativeModel):
         
         # Get continuous variables from config to distinguish them in loss computation
         self.continuous_context_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "continuous"]
+        self.categorical_context_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "categorical"]
 
     def predict_noise_from_start(
         self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor
@@ -303,7 +304,7 @@ class Diffusion_TS(GenerativeModel):
             
             if var_name in self.continuous_context_vars:
                 loss = F.mse_loss(outputs, labels.float())
-            else:
+            elif var_name in self.categorical_context_vars:
                 loss = self.auxiliary_loss(outputs, labels)
             
             cond_loss += loss.mean()

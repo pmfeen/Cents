@@ -12,7 +12,7 @@ from omegaconf import ListConfig
 
 from cents.datasets.utils import split_timeseries
 from cents.models.base import NormalizerModel
-from cents.models.context import MLPContextModule, SepMLPContextModule  # Import to trigger registration
+from cents.models.context import MLPContextModule, SepMLPContextModule, DynamicContextModule # Import to trigger registration
 from cents.models.context_registry import get_context_module_cls
 from cents.models.stats_head_registry import register_stats_head, get_stats_head_cls
 from cents.models.registry import register_model
@@ -136,7 +136,8 @@ class _NormalizerModule(nn.Module):
 
     def __init__(
         self,
-        cond_module: nn.Module,
+        static_cond_module: nn.Module = None,
+        dynamic_cond_module: nn.Module = None,
         hidden_dim: int = 512,
         time_series_dims: int = 2,
         do_scale: bool = True,
@@ -144,15 +145,36 @@ class _NormalizerModule(nn.Module):
     ):
         """
         Args:
-            cond_module: ContextModule instance for embedding context variables.
+            static_cond_module: ContextModule instance for static context variables (categorical + continuous).
+            dynamic_cond_module: ContextModule instance for dynamic context variables (time_series).
             hidden_dim: Hidden dimension size for the stats head.
             time_series_dims: Number of time series dimensions.
             do_scale: Whether to include scaling predictions.
             stats_head_type: Type of stats head to use (from registry).
         """
         super().__init__()
-        self.cond_module = cond_module
-        self.embedding_dim = cond_module.embedding_dim
+        self.static_cond_module = static_cond_module
+        self.dynamic_cond_module = dynamic_cond_module
+        
+        # Determine embedding dimension from available modules
+        if static_cond_module is not None:
+            self.embedding_dim = static_cond_module.embedding_dim
+        elif dynamic_cond_module is not None:
+            self.embedding_dim = dynamic_cond_module.embedding_dim
+        else:
+            raise ValueError("At least one of static_cond_module or dynamic_cond_module must be provided")
+        
+        # If both modules exist, combine their embeddings
+        if static_cond_module is not None and dynamic_cond_module is not None:
+            # Combine embeddings from both modules
+            combined_dim = static_cond_module.embedding_dim + dynamic_cond_module.embedding_dim
+            self.combine_mlp = nn.Sequential(
+                nn.Linear(combined_dim, self.embedding_dim),
+                nn.ReLU(),
+            )
+        else:
+            self.combine_mlp = None
+        
         # Use registry to get the stats head class
         StatsHeadCls = get_stats_head_cls(stats_head_type)
         self.stats_head = StatsHeadCls(
@@ -162,25 +184,68 @@ class _NormalizerModule(nn.Module):
             do_scale=do_scale,
         )
 
-    def forward(self, cat_vars_dict: dict):
+    def forward(self, context_vars_dict: dict):
         """
         Compute normalization parameters from categorical context.
 
         Args:
-            cat_vars_dict: Mapping of context variable names to label tensors.
+            context_vars_dict: Mapping of context variable names to label tensors.
+                             Static vars: single values (categorical: long, continuous: float)
+                             Dynamic vars: time series sequences (batch, seq_len)
 
         Returns:
             Tuple of (pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped).
         """
-        # Ensure all tensors in the dict are on the same device and properly connected
-        # This helps with DataLoader multiprocessing issues
-        device = next(self.cond_module.parameters()).device
-        cat_vars_dict = {
-            k: v.to(device, non_blocking=False) if isinstance(v, torch.Tensor) else v
-            for k, v in cat_vars_dict.items()
-        }
+        embeddings = []
         
-        embedding, _ = self.cond_module(cat_vars_dict)
+        # Process static context variables
+        if self.static_cond_module is not None:
+            # Filter static context variables
+            static_vars = {
+                k: v for k, v in context_vars_dict.items()
+                if k not in getattr(self, '_dynamic_var_names', [])
+            }
+            if static_vars:
+                device = next(self.static_cond_module.parameters()).device
+                static_vars = {
+                    k: v.to(device, non_blocking=False) if isinstance(v, torch.Tensor) else v
+                    for k, v in static_vars.items()
+                }
+                static_embedding, _ = self.static_cond_module(static_vars)
+                embeddings.append(static_embedding)
+        
+        # Process dynamic context variables
+        if self.dynamic_cond_module is not None:
+            # Filter dynamic context variables
+            dynamic_var_names = getattr(self, '_dynamic_var_names', [])
+            dynamic_vars = {
+                k: v for k, v in context_vars_dict.items()
+                if k in dynamic_var_names
+            }
+            if dynamic_vars:
+                device = next(self.dynamic_cond_module.parameters()).device
+                dynamic_vars = {
+                    k: v.to(device, non_blocking=False) if isinstance(v, torch.Tensor) else v
+                    for k, v in dynamic_vars.items()
+                }
+                dynamic_embedding, _ = self.dynamic_cond_module(dynamic_vars)
+                # Check for NaN in dynamic embedding
+                if torch.isnan(dynamic_embedding).any() or torch.isinf(dynamic_embedding).any():
+                    raise ValueError(
+                        f"NaN/Inf detected in dynamic embedding. "
+                        f"Dynamic vars: {list(dynamic_vars.keys())}"
+                    )
+                embeddings.append(dynamic_embedding)
+        
+        # Combine embeddings if both exist
+        if len(embeddings) == 2:
+            combined = torch.cat(embeddings, dim=1)
+            embedding = self.combine_mlp(combined)
+        elif len(embeddings) == 1:
+            embedding = embeddings[0]
+        else:
+            raise ValueError("No context variables provided")
+        
         return self.stats_head(embedding)
 
 
@@ -214,35 +279,69 @@ class Normalizer(NormalizerModel):
         # Get continuous variables from config if specified
         continuous_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "continuous"]
         categorical_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "categorical"]
-        self.context_vars = categorical_vars + continuous_vars
+        dynamic_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "time_series"]
+        
+        self.static_context_vars = categorical_vars + continuous_vars
+        self.dynamic_context_vars = dynamic_vars
+        self.context_vars = self.static_context_vars + self.dynamic_context_vars
         
         self.time_series_cols = dataset_cfg.time_series_columns[
             : dataset_cfg.time_series_dims
         ]
         self.time_series_dims = dataset_cfg.time_series_dims
         self.do_scale = dataset_cfg.scale
+        self.seq_len = dataset_cfg.seq_len
 
         # Get context config
-        context_cfg = get_context_config()
-        context_module_type = context_cfg.dynamic_context.type
-        stats_head_type = context_cfg.normalizer.stats_head_type
+        # context_cfg = get_context_config()
+
+        self.static_module_type = self.dataset.static_module_type
+        self.dynamic_module_type = self.dataset.dynamic_module_type
+        self.stats_head_type = self.dataset.stats_head_type
         
-        # Use registry to get the context module class
-        ContextModuleCls = get_context_module_cls(context_module_type)
-        # Create context module - it will be stored in normalizer_model.cond_module
-        context_module = ContextModuleCls(
-            self.dataset_cfg.context_vars, 
-            256, 
-        )
+        # Create static context module (for categorical + continuous)
+        static_context_module = None
+        if self.static_context_vars:
+            StaticContextModuleCls = get_context_module_cls(self.static_module_type)
+            # Filter context_vars to only static ones
+            static_context_vars_dict = {
+                k: v for k, v in self.dataset_cfg.context_vars.items() 
+                if k in self.static_context_vars
+            }
+            static_context_module = StaticContextModuleCls(
+                static_context_vars_dict,
+                256,
+            )
+        
+        # Create dynamic context module (for time_series)
+        dynamic_context_module = None
+        if self.dynamic_context_vars and self.dynamic_module_type is not None:
+            DynamicContextModuleCls = get_context_module_cls("dynamic", self.dynamic_module_type)
+            # Filter context_vars to only dynamic ones
+            dynamic_context_vars_dict = {
+                k: v for k, v in self.dataset_cfg.context_vars.items() 
+                if k in self.dynamic_context_vars
+            }
+            dynamic_context_module = DynamicContextModuleCls(
+                dynamic_context_vars_dict,
+                256,
+                seq_len=self.seq_len,
+            )
         
         self.normalizer_model = _NormalizerModule(
-            cond_module=context_module,
+            static_cond_module=static_context_module,
+            dynamic_cond_module=dynamic_context_module,
             hidden_dim=512,
             time_series_dims=self.time_series_dims,
             do_scale=self.do_scale,
-            stats_head_type=stats_head_type,
+            stats_head_type=self.stats_head_type,
         )
-        self.context_module = self.normalizer_model.cond_module
+        # Store dynamic var names for filtering in forward
+        self.normalizer_model._dynamic_var_names = self.dynamic_context_vars
+        # For backward compatibility, expose the static context module
+        self.context_module = self.normalizer_model.static_cond_module
+        # Expose the dynamic context module at top level so it shows in model summary
+        self.dynamic_cond_module = self.normalizer_model.dynamic_cond_module
 
         # Will be populated in setup()
         self.group_stats = {}
@@ -332,8 +431,8 @@ class Normalizer(NormalizerModel):
         Returns:
             loss tensor.
         """
-        cat_vars_dict, mu_t, sigma_t, zmin_t, zmax_t = batch
-        pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped = self(cat_vars_dict)
+        context_vars_dict, mu_t, sigma_t, zmin_t, zmax_t = batch
+        pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped = self(context_vars_dict)
 
         # Use standard MSE loss for mu
         loss_mu = F.mse_loss(pred_mu, mu_t)
@@ -442,8 +541,8 @@ class Normalizer(NormalizerModel):
             ds,
             batch_size=self.normalizer_training_cfg.batch_size,
             shuffle=True,
-            num_workers=8,  # Reduce workers to avoid synchronization issues
-            persistent_workers=True,
+            num_workers=4,  # Use fewer workers to reduce overhead
+            persistent_workers=False,  # Disable to avoid multiprocessing cleanup issues
             pin_memory=torch.cuda.is_available(),  # Helps with GPU transfer
             prefetch_factor=2,  # Reduce prefetch to avoid memory issues
         )
@@ -453,12 +552,29 @@ class Normalizer(NormalizerModel):
         Compute per-group (context combination) statistics from raw data.
 
         Returns:
-            Mapping from context tuple to (mu_array, std_array, zmin_array, zmax_array).
+            Mapping from context tuple to (mu_array, std_array, zmin_array, zmax_array, dynamic_ctx_dict).
         """
         df = self.dataset.data.copy()
         grouped_stats = {}
-        for group_vals, group_df in df.groupby(self.context_vars):
+        for group_vals, group_df in df.groupby(self.static_context_vars):
             dimension_points = [[] for _ in range(self.time_series_dims)]
+            # Store dynamic context variables (time series) for this group
+            # We'll use the first row's dynamic context as representative
+            dynamic_ctx_dict = {}
+            if self.dynamic_context_vars:
+                first_row = group_df.iloc[0]
+                for var_name in self.dynamic_context_vars:
+                    if var_name in first_row:
+                        # Get the time series sequence
+                        ts_data = first_row[var_name]
+                        if isinstance(ts_data, np.ndarray):
+                            dynamic_ctx_dict[var_name] = ts_data
+                        elif isinstance(ts_data, list):
+                            dynamic_ctx_dict[var_name] = np.array(ts_data)
+                        else:
+                            # If it's a scalar, repeat it to match seq_len
+                            dynamic_ctx_dict[var_name] = np.full(self.seq_len, ts_data)
+            
             for _, row in group_df.iterrows():
                 for d, col_name in enumerate(self.time_series_cols):
                     arr = np.array(row[col_name], dtype=np.float32).flatten()
@@ -494,6 +610,7 @@ class Normalizer(NormalizerModel):
                 std_array,
                 z_min_array,
                 z_max_array,
+                dynamic_ctx_dict,
             )
         return grouped_stats
 
@@ -502,15 +619,16 @@ class Normalizer(NormalizerModel):
         Build an internal Dataset yielding true stats for each context group.
 
         Returns:
-            PyTorch Dataset of samples (cat_vars_dict, mu, sigma, zmin, zmax).
+            PyTorch Dataset of samples (context_vars_dict, mu, sigma, zmin, zmax).
         """
         data_tuples = [
-            (ctx_tuple, mu_arr, sigma_arr, zmin_arr, zmax_arr)
+            (ctx_tuple, mu_arr, sigma_arr, zmin_arr, zmax_arr, dynamic_ctx_dict)
             for ctx_tuple, (
                 mu_arr,
                 sigma_arr,
                 zmin_arr,
                 zmax_arr,
+                dynamic_ctx_dict,
             ) in self.group_stats.items()
         ]
 
@@ -521,11 +639,13 @@ class Normalizer(NormalizerModel):
             Adapter Dataset to wrap group_stats tuples for DataLoader.
             """
 
-            def __init__(self, samples, context_vars, do_scale, continuous_vars):
+            def __init__(self, samples, static_context_vars, dynamic_context_vars, do_scale, continuous_vars, dataset_cfg):
                 self.samples = samples
-                self.context_vars = context_vars
+                self.static_context_vars = static_context_vars
+                self.dynamic_context_vars = dynamic_context_vars
                 self.do_scale = do_scale
                 self.continuous_vars = continuous_vars
+                self.dataset_cfg = dataset_cfg
 
             def __len__(self) -> int:
                 return len(self.samples)
@@ -538,27 +658,52 @@ class Normalizer(NormalizerModel):
                     idx: Index of the sample.
 
                 Returns:
-                    cat_vars_dict: Tensor dict of context labels.
+                    context_vars_dict: Tensor dict of context labels (static + dynamic).
                     mu_t: True mean tensor.
                     sigma_t: True std tensor.
                     zmin_t: True min z-score tensor or None.
                     zmax_t: True max z-score tensor or None.
                 """
-                ctx_tuple, mu_arr, sigma_arr, zmin_arr, zmax_arr = self.samples[idx]
-                cat_vars_dict = {}
+                ctx_tuple, mu_arr, sigma_arr, zmin_arr, zmax_arr, dynamic_ctx_dict = self.samples[idx]
+                context_vars_dict = {}
                 
-                for i, var_name in enumerate(self.context_vars):
+                # Process static context variables
+                for i, var_name in enumerate(self.static_context_vars):
                     if var_name in self.continuous_vars:
-                        cat_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.float32)
+                        context_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.float32)
                     else:
-                        cat_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.long)
+                        context_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.long)
+                
+                # Process dynamic context variables (time series)
+                for var_name in self.dynamic_context_vars:
+                    if var_name in dynamic_ctx_dict:
+                        ts_data = dynamic_ctx_dict[var_name]
+                        # Convert to tensor
+                        if isinstance(ts_data, np.ndarray):
+                            # Check if it's categorical (integer) or numeric (float)
+                            var_info = self.dataset_cfg.context_vars.get(var_name, None)
+                            if var_info and var_info[1] is not None:
+                                # Categorical time series
+                                context_vars_dict[var_name] = torch.from_numpy(ts_data).long()
+                            else:
+                                # Numeric time series
+                                context_vars_dict[var_name] = torch.from_numpy(ts_data).float()
+                        else:
+                            # Fallback: convert to array first
+                            ts_array = np.array(ts_data)
+                            var_info = self.dataset_cfg.context_vars.get(var_name, None)
+                            if var_info and var_info[1] is not None:
+                                context_vars_dict[var_name] = torch.from_numpy(ts_array).long()
+                            else:
+                                context_vars_dict[var_name] = torch.from_numpy(ts_array).float()
+                
                 mu_t = torch.from_numpy(mu_arr).float()
                 sigma_t = torch.from_numpy(sigma_arr).float()
                 zmin_t = torch.from_numpy(zmin_arr).float() if self.do_scale else None
                 zmax_t = torch.from_numpy(zmax_arr).float() if self.do_scale else None
-                return cat_vars_dict, mu_t, sigma_t, zmin_t, zmax_t
+                return context_vars_dict, mu_t, sigma_t, zmin_t, zmax_t
 
-        return _TrainSet(data_tuples, self.context_vars, self.do_scale, continuous_vars)
+        return _TrainSet(data_tuples, self.static_context_vars, self.dynamic_context_vars, self.do_scale, continuous_vars, self.dataset_cfg)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -595,7 +740,16 @@ class Normalizer(NormalizerModel):
                 for v in self.context_vars:
                     if v in continuous_vars:
                         ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
+                    elif v in self.dynamic_context_vars:
+                        # Dynamic (time series) variable
+                        if v in categorical_ts:
+                            # Categorical time series - keep as long
+                            ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
+                        else:
+                            # Numeric time series - convert to float32
+                            ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
                     else:
+                        # Static categorical variable
                         ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
                 mu, sigma, zmin, zmax, _ = self(ctx)
                 mu, sigma = mu[0].cpu().numpy(), sigma[0].cpu().numpy()
@@ -642,12 +796,23 @@ class Normalizer(NormalizerModel):
         df_out = df.copy()
         self.eval()
         continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
+        # Get categorical time series from dataset if available
+        categorical_ts = getattr(self.dataset, 'categorical_time_series', {})
         with torch.no_grad():
             for i, row in tqdm(df_out.iterrows(), total=len(df_out), desc="Inverse normalizing"):
                 ctx = {}
                 for v in self.context_vars:
                     if v in continuous_vars:
+                        # Static continuous variable
                         ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
+                    elif v in self.dynamic_context_vars:
+                        # Dynamic (time series) variable
+                        if v in categorical_ts:
+                            # Categorical time series - keep as long
+                            ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
+                        else:
+                            # Numeric time series - convert to float32
+                            ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
                     else:
                         ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
                 mu, sigma, zmin, zmax, _ = self(ctx)

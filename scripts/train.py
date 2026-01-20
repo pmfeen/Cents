@@ -5,7 +5,7 @@ from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
 from cents.datasets.airquality import AirQualityDataset
 from cents.trainer import Trainer
-from cents.utils.utils import set_context_config_path
+from cents.utils.utils import set_context_config_path, set_context_overrides
 from pytorch_lightning.callbacks import EarlyStopping
 import warnings
 import argparse
@@ -20,6 +20,10 @@ def main(args) -> None:
     # Set custom context config path if provided
     if args.context_config_path:
         set_context_config_path(args.context_config_path)
+    
+    # Set context config overrides if provided
+    if args.context_overrides:
+        set_context_overrides(args.context_overrides)
     
     # Skip heavy processing for DDP compatibility
 
@@ -80,6 +84,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable_checkpointing", type=bool, default=True)
     parser.add_argument("--context-config-path", type=str, default=None, 
                         help="Path to custom context config YAML file (optional)")
+    parser.add_argument("--context-overrides", type=str, nargs="*", default=[],
+                        help="Override context config values (e.g., 'static_context.type=mlp' 'dynamic_context.type=cnn')")
 
     args = parser.parse_args()
     main(args)

@@ -108,7 +108,10 @@ def split_dataset(dataset: Dataset, val_split: float = 0.1) -> Tuple[Dataset, Da
 
 
 def encode_context_variables(
-    data: pd.DataFrame, columns_to_encode: List[str], bins: int, numeric_cols: List[str] = None, continuous_vars: List[str] = None
+    data: pd.DataFrame, columns_to_encode: List[str], bins: int, 
+    numeric_cols: List[str] = None, continuous_vars: List[str] = None,
+    time_series_cols: List[str] = None,
+    categorical_time_series: Dict[str, int] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[int, Any]]]:
     """
     Encodes specified columns in the DataFrame either by binning numeric columns
@@ -159,10 +162,11 @@ def encode_context_variables(
 
     for col in columns_to_encode:
         # Skip continuous variables - they should remain as float values
-        if col in continuous_vars:
+        if col in categorical_time_series:
+            encoded_data[col], mapping[col] = encode_list_column(encoded_data[col])
+        elif col in time_series_cols or col in continuous_vars:
             continue
-            
-        if numeric_cols and col in numeric_cols:
+        elif numeric_cols and col in numeric_cols:
             # Numeric column: Perform binning
             # Handle NaN values by filling with median before binning
             if encoded_data[col].isna().all():
@@ -251,3 +255,16 @@ def convert_generated_data_to_df(
         records.append(record)
 
     return pd.DataFrame.from_records(records)
+
+def encode_list_column(series: pd.Series):
+    count = 0
+    for x in series:
+        for t in x:
+            if pd.isna(t):
+                count += 1
+    vocab = sorted({t for x in series for t in x})
+    tok2id = {t: i for i, t in enumerate(vocab)}
+    encoded = series.apply(lambda x: [tok2id[t] for t in x])
+    encoded = encoded.map(tuple)
+    mapping = dict(enumerate(vocab))  # id -> token
+    return encoded, mapping

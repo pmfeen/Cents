@@ -13,8 +13,9 @@ def _ckpt_name(
     dims: int, 
     *, 
     ext: str = "ckpt",
-    context_module_type: str = None,
-    stats_head_type: str = None
+    static_module_type: str = None,
+    stats_head_type: str = None,
+    dynamic_module_type: str = None,
 ) -> str:
     """
     Generate checkpoint filename with optional context_module_type and stats_head_type.
@@ -32,11 +33,14 @@ def _ckpt_name(
     """
     parts = [dataset, model, f"dim{dims}"]
     
-    if context_module_type:
-        parts.append(f"ctx{context_module_type}")
+    if static_module_type:
+        parts.append(f"ctx{static_module_type}")
     
     if stats_head_type:
         parts.append(f"stats{stats_head_type}")
+    
+    if dynamic_module_type:
+        parts.append(f"dyn{dynamic_module_type}")
     
     return "_".join(parts) + f".{ext}"
 
@@ -67,6 +71,7 @@ def get_normalizer_training_config():
     return OmegaConf.load(config_path)
 
 _context_config_path = None
+_context_overrides = []
 
 
 def set_context_config_path(path: str):
@@ -80,9 +85,22 @@ def set_context_config_path(path: str):
     global _context_config_path
     _context_config_path = path
 
+
+def set_context_overrides(overrides: list):
+    """
+    Set overrides to apply to the context configuration.
+    
+    Args:
+        overrides: List of override strings (e.g., ["static_context.type=mlp", "dynamic_context.type=cnn"])
+    """
+    global _context_overrides
+    _context_overrides = overrides if overrides else []
+
+
 def get_context_config(path: str = None):
     """
     Load the context configuration from config/context/default.yaml or a custom path.
+    Overrides can be applied if set via set_context_overrides().
     
     Args:
         path: Optional path to a custom context config file. If None, uses the path
@@ -103,7 +121,16 @@ def get_context_config(path: str = None):
             "context",
             "default.yaml",
         )
-    return OmegaConf.load(config_path)
+    
+    cfg = OmegaConf.load(config_path)
+    
+    # Apply overrides if any
+    if _context_overrides:
+        from cents.utils.config_loader import apply_overrides
+        cfg = apply_overrides(cfg, _context_overrides)
+        print(f"Applied context config overrides: {_context_overrides}")
+    
+    return cfg
 
 
 def get_default_trainer_config():

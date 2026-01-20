@@ -25,5 +25,5 @@ context_vars:
   weekday: ["categorical", 7]
   site_id: ["categorical", 19]
   primaryspaceusage: ["categorical", 16]
-  sqft: ["continuous", None]
-  yearbuilt: ["continuous", None]
+  sqft: ["continuous", null]
+  yearbuilt: ["continuous", null]

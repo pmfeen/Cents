@@ -67,7 +67,7 @@ class TimeSeriesDataset(Dataset):
             if isinstance(time_series_column_names, list)
             else [time_series_column_names]
         )
-        self.time_series_dims = len(self.time_series_column_names)
+        self.time_series_dims = self.cfg.time_series_dims
         self.context_vars = context_var_column_names or []
         self.seq_len = seq_len
 
@@ -93,21 +93,7 @@ class TimeSeriesDataset(Dataset):
             self.name = "custom"
 
         # Add continuous variables to context_vars if specified
-        continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
-        # Convert to plain Python list if it's a ListConfig from OmegaConf
-        if continuous_vars:
-            if isinstance(continuous_vars, ListConfig):
-                continuous_vars = [str(v) for v in continuous_vars]
-            elif isinstance(continuous_vars, list):
-                continuous_vars = [str(v) for v in continuous_vars]
-            else:
-                continuous_vars = [str(continuous_vars)]
-        else:
-            continuous_vars = []
-        
-        # Ensure continuous variables are included in self.context_vars
-        if continuous_vars:
-            self.context_vars = list(self.context_vars) + [v for v in continuous_vars if v not in self.context_vars]
+        self.continuous_vars = [k for k, v in self.cfg.context_vars.items() if v[0] == "continuous"]
 
         self.normalize = normalize
         self.scale = scale
@@ -121,8 +107,7 @@ class TimeSeriesDataset(Dataset):
         # Preprocess and optionally encode context
         self.data = self._preprocess_data(data)
 
-        continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
-        if continuous_vars:
+        if self.continuous_vars:
             self._normalize_continuous_vars()
 
         if size is not None:
@@ -132,11 +117,11 @@ class TimeSeriesDataset(Dataset):
             self.data, self.context_var_codes = self._encode_context_vars(self.data)
         self._save_context_var_codes()
 
+
         is_ddp_subprocess = self._is_ddp_subprocess()
         if self.normalize:
             self._init_normalizer()
             cache_path = self._get_normalization_cache_path()
-            
             if cache_path.exists():
                 print(f"[{'DDP Subprocess' if is_ddp_subprocess else 'Main Process'}] Loading pre-normalized data from cache")
                 with open(cache_path, 'rb') as f:
@@ -146,7 +131,6 @@ class TimeSeriesDataset(Dataset):
                 if not is_ddp_subprocess:
                     print("[Main Process] Normalizing data...")
                 self.data = self._normalizer.transform(self.data)
-                
                 # Save to cache for subprocesses (only main process)
                 if not is_ddp_subprocess:
                     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,6 +139,7 @@ class TimeSeriesDataset(Dataset):
                     print(f"[Main Process] Cached normalized data for subprocesses")
         self.data = self.merge_timeseries_columns(self.data)
         self.data = self.data.reset_index()
+
         
         # Check if we should skip heavy processing for DDP
         if is_ddp_subprocess and skip_heavy_processing:
@@ -265,7 +250,7 @@ class TimeSeriesDataset(Dataset):
         #     if col in self.data.columns:
         #         print(self.data[col].mean())
         return DataLoader(
-            self, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=persistent_workers
+            self, batch_size=batch_size, shuffle=shuffle, num_workers=8, persistent_workers=persistent_workers
         )
 
     def split_timeseries(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -364,13 +349,17 @@ class TimeSeriesDataset(Dataset):
         Returns:
             Tuple of encoded DataFrame and mapping codes.
         """
-        continuous_vars = getattr(self.cfg, 'continuous_context_vars', None)
+        continuous_vars = [k for k, v in self.cfg.context_vars.items() if v[0] == "continuous"]
+        time_series_cols = [k for k, v in self.cfg.context_vars.items() if v[0] == "time_series"]
+        numeric_cols = [k for k, v in self.cfg.context_vars.items() if v[0] == "categorical" and v[1] == None]
         encoded_data, mapping = encode_context_variables(
             data=data,
             columns_to_encode=self.context_vars,
             bins=self.numeric_context_bins,
-            numeric_cols=getattr(self.cfg, 'numeric_cols', None),
+            numeric_cols=numeric_cols,
             continuous_vars=continuous_vars,
+            time_series_cols=time_series_cols,
+            categorical_time_series=self.categorical_time_series,
         )
         
         return encoded_data, mapping
@@ -380,14 +369,13 @@ class TimeSeriesDataset(Dataset):
         Normalize continuous context variables in the dataset using z-score normalization.
         This is done once during dataset initialization, so models receive pre-normalized values.
         """
-        continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
-        if not continuous_vars:
+        if not self.continuous_vars:
             return
         
         # Store stats for potential inverse transform if needed
         self.continuous_var_stats = {}
         
-        for var_name in continuous_vars:
+        for var_name in self.continuous_vars:
             if var_name in self.data.columns:
                 values = self.data[var_name]
                 # Compute mean and std
@@ -650,15 +638,17 @@ class TimeSeriesDataset(Dataset):
         
         # Get context_module_type and stats_head_type from context config
         context_cfg = get_context_config()
-        context_module_type = context_cfg.dynamic_context.type
-        stats_head_type = context_cfg.normalizer.stats_head_type
-        
+
+        self.dynamic_module_type = context_cfg.dynamic_context.type 
+        self.static_module_type = context_cfg.static_context.type
+        self.stats_head_type = context_cfg.normalizer.stats_head_type
         cache_path = normalizer_dir / _ckpt_name(
             self.name, 
             "normalizer", 
             self.time_series_dims,
-            context_module_type=context_module_type,
-            stats_head_type=stats_head_type
+            static_module_type=self.static_module_type,
+            stats_head_type=self.stats_head_type,
+            dynamic_module_type=self.dynamic_module_type,
         )
 
         ncfg = get_normalizer_training_config()

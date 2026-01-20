@@ -24,12 +24,13 @@ def register_context_module(*names):
     return decorator
 
 
-def get_context_module_cls(key: str) -> type:
+def get_context_module_cls(key: str, subkey: str = None) -> type:
     """
-    Fetch the context module class for `key`. Raises if not found.
+    Fetch the context module class for `key` (and optionally `subkey`). Raises if not found.
     
     Args:
-        key: The name of the context module to retrieve.
+        key: The name of the context module to retrieve (e.g., "default", "dynamic").
+        subkey: Optional subkey for two-part registration (e.g., "mlp", "cnn").
         
     Returns:
         The context module class.
@@ -37,11 +38,20 @@ def get_context_module_cls(key: str) -> type:
     Raises:
         ValueError: If the key is not found in the registry.
     """
+    # Try two-part key first if subkey is provided
+    if subkey is not None:
+        two_part_key = f"{key}_{subkey}"
+        if two_part_key in _CONTEXT_MODULE_REGISTRY:
+            return _CONTEXT_MODULE_REGISTRY[two_part_key]
+    
+    # Try single key
     try:
         return _CONTEXT_MODULE_REGISTRY[key]
     except KeyError:
+        available = list(_CONTEXT_MODULE_REGISTRY.keys())
         raise ValueError(
-            f"Unknown context module '{key}'. Available: {list(_CONTEXT_MODULE_REGISTRY.keys())}"
+            f"Unknown context module '{key}'" + (f" with subkey '{subkey}'" if subkey else "") +
+            f". Available: {available}"
         )
 
 

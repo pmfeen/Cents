@@ -43,7 +43,6 @@ class BaseModel(pl.LightningModule, ABC):
                 # Get context module type from context config
                 context_cfg = get_context_config()
                 context_module_type = context_cfg.static_context.type
-                
                 # Get continuous variables from config if specified
                 # continuous_vars = getattr(cfg.dataset, "continuous_context_vars", None)
                 # Use registry to get the context module class

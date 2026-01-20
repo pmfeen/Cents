@@ -32,6 +32,8 @@ def _coerce_scalar(value: str):
     v = value.strip()
     if v.lower() in ("true", "false"):
         return v.lower() == "true"
+    if v.lower() in ("null", "none"):
+        return None
     try:
         return int(v)
     except ValueError:
