@@ -119,6 +119,9 @@ class SepMLPContextModule(BaseContextModule):
             }
         )
 
+        print(self.continuous_vars, "CONT VARS")
+        print(self.categorical_vars, "CAT VARS")
+
         # For continuous variables, use a simple linear projection
         self.continuous_projections = nn.ModuleDict(
             {
@@ -260,7 +263,7 @@ class SepMLPContextModule(BaseContextModule):
 
 
 @register_context_module("dynamic_cnn")
-class DynamicContextModule(BaseContextModule):
+class DynamicContextModule_CNN(BaseContextModule):
     """
     Context module for processing dynamic (time series) context variables.
     Uses 1D convolutions to encode time series sequences into embeddings.
@@ -427,3 +430,247 @@ class DynamicContextModule(BaseContextModule):
             raise ValueError(f"NaN/Inf detected in final embedding after mixing MLP")
         
         return embedding, {}
+
+
+@register_context_module("dynamic_transformer")
+class DynamicContextModule_Transformer(BaseContextModule):
+    """
+    Context module for processing dynamic (time series) context variables.
+    Uses Transformer encoder to encode time series sequences into embeddings.
+    """
+    
+    def __init__(
+        self,
+        context_vars: dict[str, int],
+        embedding_dim: int,
+        seq_len: int = None,
+        n_layers: int = 2,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        dim_feedforward: int = 256,
+    ):
+        """
+        Initialize DynamicContextModule_Transformer.
+        
+        Args:
+            context_vars: Mapping of variable names to category counts (for categorical time series)
+                         or None (for numeric time series). Format: {name: [type, num_categories]}
+            embedding_dim: Size of embedding vectors.
+            seq_len: Sequence length of time series context variables.
+            n_layers: Number of transformer encoder layers.
+            n_heads: Number of attention heads.
+            dropout: Dropout probability.
+            dim_feedforward: Dimension of feedforward network in transformer.
+        """
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.seq_len = seq_len
+        
+        # Separate categorical and numeric time series
+        self.categorical_ts_vars = {
+            k: v[1] for k, v in context_vars.items() 
+            if v[0] == "time_series" and v[1] is not None
+        }
+        self.numeric_ts_vars = [
+            k for k, v in context_vars.items() 
+            if v[0] == "time_series" and v[1] is None
+        ]
+        
+        # For categorical time series, use embedding
+        self.ts_embeddings = nn.ModuleDict({
+            name: nn.Embedding(num_categories, embedding_dim)
+            for name, num_categories in self.categorical_ts_vars.items()
+        })
+        
+        # For numeric time series, use linear projection to embedding_dim
+        self.ts_projections = nn.ModuleDict({
+            name: nn.Linear(1, embedding_dim)
+            for name in self.numeric_ts_vars
+        })
+        
+        # Positional encoding for transformer
+        if seq_len is not None:
+            self.pos_encodings = nn.ParameterDict({
+                name: nn.Parameter(torch.zeros(1, seq_len, embedding_dim))
+                for name in list(self.categorical_ts_vars.keys()) + self.numeric_ts_vars
+            })
+        else:
+            # If seq_len not provided, use learnable positional encoding that can adapt
+            self.pos_encodings = None
+        
+        # Transformer encoder for each time series variable
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+        )
+        
+        self.ts_encoders = nn.ModuleDict({
+            name: nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+            for name in list(self.categorical_ts_vars.keys()) + self.numeric_ts_vars
+        })
+        
+        # Pooling layer to get fixed-size embedding from sequence
+        # Use learnable weighted pooling (attention pooling)
+        self.pooling_layers = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.Tanh(),
+                nn.Linear(embedding_dim, 1, bias=False),
+            )
+            for name in list(self.categorical_ts_vars.keys()) + self.numeric_ts_vars
+        })
+        
+        # Mixing MLP to combine all time series embeddings
+        total_dim = embedding_dim * (len(self.categorical_ts_vars) + len(self.numeric_ts_vars))
+        if total_dim > 0:
+            self.mixing_mlp = nn.Sequential(
+                nn.Linear(total_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, embedding_dim),
+            )
+        else:
+            self.mixing_mlp = nn.Identity()
+        
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """
+        Initialize weights using appropriate initialization strategies.
+        """
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Xavier initialization for transformer linear layers
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Parameter):
+                # Initialize positional encodings
+                if module.dim() == 3:  # (1, seq_len, embedding_dim)
+                    nn.init.normal_(module, std=0.02)
+            # Note: Embedding layers keep their default initialization
+            # Transformer encoder layers use their own initialization
+    
+    def forward(self, context_vars: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        Process dynamic (time series) context variables using Transformer.
+        
+        Args:
+            context_vars: Dict mapping variable names to tensors.
+                         For categorical TS: (batch, seq_len) with integer values
+                         For numeric TS: (batch, seq_len) with float values
+        
+        Returns:
+            embedding: Combined embedding of shape (batch_size, embedding_dim)
+            outputs: Empty dict for compatibility
+        """
+        embeddings = []
+        
+        # Process categorical time series
+        for name in self.categorical_ts_vars.keys():
+            if name in context_vars:
+                # Input: (batch, seq_len) with integer indices
+                ts_data = context_vars[name]  # (batch, seq_len)
+                # Check for NaN/Inf in input
+                if torch.isnan(ts_data).any() or torch.isinf(ts_data).any():
+                    raise ValueError(f"NaN/Inf detected in categorical time series input '{name}'")
+                
+                # Embed: (batch, seq_len) -> (batch, seq_len, embedding_dim)
+                embedded = self.ts_embeddings[name](ts_data)
+                
+                # Add positional encoding if available
+                if self.pos_encodings is not None and name in self.pos_encodings:
+                    seq_len_actual = embedded.size(1)
+                    pos_enc = self.pos_encodings[name][:, :seq_len_actual, :]
+                    embedded = embedded + pos_enc
+                
+                # Check for NaN after embedding
+                if torch.isnan(embedded).any() or torch.isinf(embedded).any():
+                    raise ValueError(f"NaN/Inf detected after embedding for '{name}'")
+                
+                # Encode with transformer: (batch, seq_len, embedding_dim) -> (batch, seq_len, embedding_dim)
+                encoded = self.ts_encoders[name](embedded)
+                
+                # Check for NaN after encoding
+                if torch.isnan(encoded).any() or torch.isinf(encoded).any():
+                    raise ValueError(f"NaN/Inf detected after transformer encoding for '{name}'")
+                
+                # Pool to fixed size: (batch, seq_len, embedding_dim) -> (batch, embedding_dim)
+                # Use attention-based pooling
+                attention_weights = self.pooling_layers[name](encoded)  # (batch, seq_len, 1)
+                attention_weights = torch.softmax(attention_weights, dim=1)
+                pooled = (encoded * attention_weights).sum(dim=1)  # (batch, embedding_dim)
+                
+                embeddings.append(pooled)
+        
+        # Process numeric time series
+        for name in self.numeric_ts_vars:
+            if name in context_vars:
+                # Input: (batch, seq_len) with float values
+                ts_data = context_vars[name]  # (batch, seq_len)
+                # Ensure numeric time series are float type (not long/int)
+                if not ts_data.is_floating_point():
+                    ts_data = ts_data.float()
+                
+                # Check for NaN/Inf in input
+                if torch.isnan(ts_data).any() or torch.isinf(ts_data).any():
+                    raise ValueError(f"NaN/Inf detected in numeric time series input '{name}'")
+                
+                # Replace NaN/Inf with zeros to prevent propagation
+                ts_data = torch.where(torch.isfinite(ts_data), ts_data, torch.zeros_like(ts_data))
+                
+                # Project to embedding_dim: (batch, seq_len) -> (batch, seq_len, embedding_dim)
+                ts_data_expanded = ts_data.unsqueeze(-1)  # (batch, seq_len, 1)
+                embedded = self.ts_projections[name](ts_data_expanded)  # (batch, seq_len, embedding_dim)
+                
+                # Add positional encoding if available
+                if self.pos_encodings is not None and name in self.pos_encodings:
+                    seq_len_actual = embedded.size(1)
+                    pos_enc = self.pos_encodings[name][:, :seq_len_actual, :]
+                    embedded = embedded + pos_enc
+                
+                # Check for NaN after projection
+                if torch.isnan(embedded).any() or torch.isinf(embedded).any():
+                    raise ValueError(f"NaN/Inf detected after projection for '{name}'")
+                
+                # Encode with transformer: (batch, seq_len, embedding_dim) -> (batch, seq_len, embedding_dim)
+                encoded = self.ts_encoders[name](embedded)
+                
+                # Check for NaN after encoding
+                if torch.isnan(encoded).any() or torch.isinf(encoded).any():
+                    raise ValueError(f"NaN/Inf detected after transformer encoding numeric TS '{name}'")
+                
+                # Pool to fixed size: (batch, seq_len, embedding_dim) -> (batch, embedding_dim)
+                # Use attention-based pooling
+                attention_weights = self.pooling_layers[name](encoded)  # (batch, seq_len, 1)
+                attention_weights = torch.softmax(attention_weights, dim=1)
+                pooled = (encoded * attention_weights).sum(dim=1)  # (batch, embedding_dim)
+                
+                embeddings.append(pooled)
+        
+        if not embeddings:
+            # No dynamic context variables, return zero embedding
+            batch_size = next(iter(context_vars.values())).size(0) if context_vars else 1
+            embedding = torch.zeros(batch_size, self.embedding_dim, device=next(iter(context_vars.values())).device if context_vars else None)
+            return embedding, {}
+        
+        # Combine all time series embeddings
+        combined = torch.cat(embeddings, dim=1)  # (batch, total_dim)
+        # Check for NaN before mixing
+        if torch.isnan(combined).any() or torch.isinf(combined).any():
+            raise ValueError(f"NaN/Inf detected in combined embeddings before mixing MLP")
+        embedding = self.mixing_mlp(combined)  # (batch, embedding_dim)
+        # Check for NaN after mixing
+        if torch.isnan(embedding).any() or torch.isinf(embedding).any():
+            raise ValueError(f"NaN/Inf detected in final embedding after mixing MLP")
+        
+        return embedding, {}
+
+    def on_after_backward(self):
+        unused = [n for n,p in self.named_parameters() if p.requires_grad and p.grad is None]
+        if unused:
+            print("UNUSED:", unused[:50])

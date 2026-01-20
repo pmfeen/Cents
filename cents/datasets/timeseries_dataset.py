@@ -675,6 +675,7 @@ class TimeSeriesDataset(Dataset):
 
         # train and cache a single state dict
         print("[Cents] Training normalizer…")
+        print(f"[Cents] devices: {ncfg.devices}")
         trainer = pl.Trainer(
             max_epochs=ncfg.n_epochs,
             accelerator=ncfg.accelerator,

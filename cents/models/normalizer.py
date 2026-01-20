@@ -12,7 +12,7 @@ from omegaconf import ListConfig
 
 from cents.datasets.utils import split_timeseries
 from cents.models.base import NormalizerModel
-from cents.models.context import MLPContextModule, SepMLPContextModule, DynamicContextModule # Import to trigger registration
+from cents.models.context import MLPContextModule, SepMLPContextModule, DynamicContextModule_CNN, DynamicContextModule_Transformer # Import to trigger registration
 from cents.models.context_registry import get_context_module_cls
 from cents.models.stats_head_registry import register_stats_head, get_stats_head_cls
 from cents.models.registry import register_model
@@ -304,12 +304,12 @@ class Normalizer(NormalizerModel):
         if self.static_context_vars:
             StaticContextModuleCls = get_context_module_cls(self.static_module_type)
             # Filter context_vars to only static ones
-            static_context_vars_dict = {
+            self.static_context_vars_dict = {
                 k: v for k, v in self.dataset_cfg.context_vars.items() 
                 if k in self.static_context_vars
             }
             static_context_module = StaticContextModuleCls(
-                static_context_vars_dict,
+                self.static_context_vars_dict,
                 256,
             )
         
@@ -516,6 +516,7 @@ class Normalizer(NormalizerModel):
                     param_count += 1
                     if param_norm.item() < 1e-8:
                         zero_grad_count += 1
+                        print(name, "HAS ZERO GRAD")
                 else:
                     # Parameter has no gradient - this might indicate a problem
                     if 'cond_module' in name or 'stats_head' in name:
@@ -546,6 +547,10 @@ class Normalizer(NormalizerModel):
             pin_memory=torch.cuda.is_available(),  # Helps with GPU transfer
             prefetch_factor=2,  # Reduce prefetch to avoid memory issues
         )
+    # def on_after_backward(self):
+    #     unused = [n for n,p in self.named_parameters() if p.requires_grad and p.grad is None]
+    #     if unused:
+    #         print("UNUSED:", unused[:50])
 
     def _compute_group_stats(self) -> dict:
         """
