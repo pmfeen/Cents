@@ -239,18 +239,22 @@ def convert_generated_data_to_df(
 
     n_samples = data_np.shape[0]
 
-    if decode:
-        if mapping is None:
-            raise ValueError("Mapping must be provided when decode=True.")
-        cond_vars = {
-            var: mapping[var][code.item()] for var, code in context_vars.items()
-        }
-    else:
-        cond_vars = {var: int(code.item()) for var, code in context_vars.items()}
+    def _get_code_at(code: Any, i: int) -> Any:
+        if isinstance(code, torch.Tensor) and code.dim() == 1 and code.shape[0] == n_samples:
+            return code[i].item()
+        return code.item() if isinstance(code, torch.Tensor) else code
 
     records = []
     for i in range(n_samples):
-        record = cond_vars.copy()
+        record = {}
+        for var, code in context_vars.items():
+            v = _get_code_at(code, i)
+            if decode:
+                if mapping is None:
+                    raise ValueError("Mapping must be provided when decode=True.")
+                record[var] = mapping[var][v]
+            else:
+                record[var] = v if isinstance(v, float) else int(v)
         record["timeseries"] = data_np[i]
         records.append(record)
 

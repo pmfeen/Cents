@@ -83,10 +83,9 @@ class TimeSeriesDataset(Dataset):
             cfg = apply_overrides(cfg, dyn)
             cfg.time_series_columns = self.time_series_column_names
             self.numeric_context_bins = cfg.numeric_context_bins
-            # context_vars = self._get_context_var_dict(data)
-            # cfg.context_vars = context_vars
             self.cfg = cfg
 
+        self.context_var_dict = self.cfg.context_vars
         self.numeric_context_bins = self.cfg.numeric_context_bins
         if not hasattr(self, "threshold"):
             self.threshold = (-self.cfg.threshold, self.cfg.threshold)
@@ -389,8 +388,13 @@ class TimeSeriesDataset(Dataset):
                     std_val = 1.0
                     print(f"[Dataset] Warning: {var_name} has zero std, using std=1.0")
                 
-                # Store stats for reference
-                self.continuous_var_stats[var_name] = {'mean': mean_val, 'std': std_val}
+                # Store stats for reference and for sampling in original range
+                self.continuous_var_stats[var_name] = {
+                    'mean': mean_val,
+                    'std': std_val,
+                    'min': float(values.min()),
+                    'max': float(values.max()),
+                }
                 
                 # Normalize the values in-place: (x - mean) / std
                 self.data[var_name] = (values - mean_val) / std_val
@@ -447,8 +451,21 @@ class TimeSeriesDataset(Dataset):
             dict: Random context index tensors.
         """
         ctx = {}
-        for var, n in self._get_context_var_dict(self.data).items():
-            ctx[var] = torch.randint(0, n, (), dtype=torch.long)
+        
+        for var, info in self.context_var_dict.items():
+            if info[0] == "categorical":
+                ctx[var] = torch.randint(0, info[1], (), dtype=torch.long)
+            elif info[0] == "continuous":
+                # Sample from original [min, max] then z-score to match training data
+                stats = getattr(self, "continuous_var_stats", {}).get(var)
+                if stats is not None and "min" in stats and "max" in stats:
+                    x_raw = np.random.uniform(stats["min"], stats["max"])
+                    x_norm = (x_raw - stats["mean"]) / stats["std"]
+                    ctx[var] = torch.tensor(x_norm, dtype=torch.float32)
+                else:
+                    raise ValueError(f"Continuous variable {var} has no stats")
+            else:
+                raise ValueError(f"Invalid context variable type: {info[0]}")
         return ctx
 
     def get_context_var_combination_rarities(
@@ -652,6 +669,8 @@ class TimeSeriesDataset(Dataset):
             stats_head_type=self.stats_head_type,
             dynamic_module_type=self.dynamic_module_type,
         )
+
+        print(f"[Cents] cache_path: {cache_path}")
 
         ncfg = get_normalizer_training_config()
         self._normalizer = Normalizer(

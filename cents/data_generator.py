@@ -57,7 +57,7 @@ class DataGenerator:
         self.device = get_device(device)
         self.cfg = cfg
         self._ctx_buff: Dict[str, torch.Tensor] = {}
-
+        self.dataset = dataset
         if model is not None:
             self.model = model.to(self.device).eval()
             self.normalizer = normalizer
@@ -243,7 +243,7 @@ class DataGenerator:
             self.normalizer = Normalizer(
                 dataset_cfg=self.cfg.dataset,
                 normalizer_training_cfg=get_normalizer_training_config(),
-                dataset=None,
+                dataset=self.dataset,
             )
             state = torch.load(normalizer_ckpt, map_location=device)
             sd = state.get("state_dict", state)

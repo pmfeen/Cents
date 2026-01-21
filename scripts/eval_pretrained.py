@@ -34,15 +34,15 @@ def main(args) -> None:
     if args.context_config_path:
         set_context_config_path(args.context_config_path)
     
-    model_ckpt = "cents/outputs/diffusion_ts_commercial_all/2025-11-13_19-50-40/commercial_diffusion_ts_dim1_ctxsep_mlp_statsmlp.ckpt"
+    model_ckpt = "cents/outputs/diffusion_ts_pecanstreet_all/2026-01-20_13-25-56/pecanstreet_diffusion_ts_dim1_ctxsep_mlp_statsmlp.ckpt"
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     )
     print("Loading dataset...")
-    # dataset = PecanStreetDataset(overrides=DATASET_OVERRIDES + PECAN_OVERRIDES)
-    dataset = CommercialDataset(overrides = DATASET_OVERRIDES)
+    dataset = PecanStreetDataset(overrides=DATASET_OVERRIDES + PECAN_OVERRIDES)
+    # dataset = CommercialDataset(overrides = DATASET_OVERRIDES)
 
-    normalizer_ckpt = HOME / ".cache/cents/checkpoints/commercial/normalizer/commercial_normalizer_dim1_ctxsep_mlp_statsmlp.ckpt"
+    normalizer_ckpt = HOME / ".cache/cents/checkpoints/pecanstreet/normalizer/pecanstreet_normalizer_dim1_ctxsep_mlp_statsmlp.ckpt"
     # Build a minimal cfg for evaluator and generator
     eval_cfg = load_yaml("cents/config/evaluator/default.yaml")
     top_cfg = load_yaml("cents/config/config.yaml")
@@ -63,7 +63,7 @@ def main(args) -> None:
     cfg.eval_disentanglement = eval_cfg.get("eval_disentanglement", True)
     cfg.job_name = eval_cfg.get("job_name", "default_job")
     cfg.save_results = True
-    cfg.save_dir = HOME / f"cents/outputs/diffusion_ts_commercial_all/2025-11-13_19-50-40/eval"
+    cfg.save_dir = HOME / f"cents/outputs/diffusion_ts_pecanstreet_all/2026-01-20_13-25-56/eval"
 
 
     if not os.path.exists(cfg.save_dir):
