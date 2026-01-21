@@ -17,7 +17,7 @@ normalizer:
 
 # Dynamic context: context module used by the normalizer for time series context variables
 dynamic_context:
-  type: cnn  # Context module type for dynamic context (e.g., "cnn")
+  type: null  # Context module type for dynamic context (e.g., "cnn")
   # Future parameters can be added here:
   # n_layers: 2
   # hidden_dim: 256
