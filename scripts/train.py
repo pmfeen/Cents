@@ -72,7 +72,7 @@ def main(args) -> None:
         overrides=trainer_overrides,
     )
 
-    trainer.fit()
+    trainer.fit(ckpt_path=args.resume_from_checkpoint)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -97,6 +97,8 @@ if __name__ == "__main__":
                         help="Override context config values (e.g., 'static_context.type=mlp' 'dynamic_context.type=cnn')")
     parser.add_argument("--force-retrain-normalizer", type=bool, default=False,
                         help="Force retraining of normalizer even if cached version exists")
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None,
+                        help="Path to checkpoint file (.ckpt) to resume training from")
 
     args = parser.parse_args()
     main(args)
