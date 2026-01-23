@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 import pandas as pd
 import pytorch_lightning as pl
 import torch
+import torch.nn as nn
 from omegaconf import DictConfig
 
 from cents.models.context import MLPContextModule, SepMLPContextModule  # Import to trigger registration
@@ -42,17 +43,75 @@ class BaseModel(pl.LightningModule, ABC):
                 emb_dim = getattr(cfg.model, "cond_emb_dim", 256)
                 # Get context module type from context config
                 context_cfg = get_context_config()
-                context_module_type = context_cfg.static_context.type
-                # Get continuous variables from config if specified
-                # continuous_vars = getattr(cfg.dataset, "continuous_context_vars", None)
-                # Use registry to get the context module class
-                ContextModuleCls = get_context_module_cls(context_module_type)
-                self.context_module = ContextModuleCls(
-                    cfg.dataset.context_vars, 
-                    emb_dim, 
-                )
+                static_module_type = context_cfg.static_context.type
+                dynamic_module_type = getattr(context_cfg.dynamic_context, "type", None)
+                
+                # Separate static and dynamic context variables
+                continuous_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "continuous"]
+                categorical_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "categorical"]
+                dynamic_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "time_series"]
+                
+                static_context_vars = categorical_vars + continuous_vars
+                self.dynamic_context_vars = dynamic_vars
+                
+                # Create static context module (for categorical + continuous)
+                self.static_context_module = None
+                if static_context_vars:
+                    StaticContextModuleCls = get_context_module_cls(static_module_type)
+                    static_context_vars_dict = {
+                        k: v for k, v in cfg.dataset.context_vars.items() 
+                        if k in static_context_vars
+                    }
+                    self.static_context_module = StaticContextModuleCls(
+                        static_context_vars_dict,
+                        emb_dim,
+                    )
+                
+                # Create dynamic context module (for time_series)
+                self.dynamic_context_module = None
+                if self.dynamic_context_vars and dynamic_module_type is not None:
+                    DynamicContextModuleCls = get_context_module_cls("dynamic", dynamic_module_type)
+                    dynamic_context_vars_dict = {
+                        k: v for k, v in cfg.dataset.context_vars.items() 
+                        if k in self.dynamic_context_vars
+                    }
+                    seq_len = getattr(cfg.dataset, "seq_len", None)
+                    if seq_len is None:
+                        raise ValueError("seq_len must be specified in cfg.dataset for dynamic context modules")
+                    self.dynamic_context_module = DynamicContextModuleCls(
+                        dynamic_context_vars_dict,
+                        emb_dim,
+                        seq_len=seq_len,
+                    )
+                
+                # Determine embedding dimension and create combine MLP if both exist
+                if self.static_context_module is not None:
+                    self.embedding_dim = self.static_context_module.embedding_dim
+                elif self.dynamic_context_module is not None:
+                    self.embedding_dim = self.dynamic_context_module.embedding_dim
+                else:
+                    raise ValueError("At least one of static_context_module or dynamic_context_module must be provided")
+                
+                # If both modules exist, create combine MLP
+                if self.static_context_module is not None and self.dynamic_context_module is not None:
+                    combined_dim = self.static_context_module.embedding_dim + self.dynamic_context_module.embedding_dim
+                    self.combine_mlp = nn.Sequential(
+                        nn.Linear(combined_dim, self.embedding_dim),
+                        nn.ReLU(),
+                    )
+                else:
+                    self.combine_mlp = None
+                
+                # For backward compatibility, expose static_context_module as context_module
+                # (but subclasses should use static_context_module and dynamic_context_module directly)
+                self.context_module = self.static_context_module
             else:
+                self.static_context_module = None
+                self.dynamic_context_module = None
                 self.context_module = None
+                self.combine_mlp = None
+                self.dynamic_context_vars = []
+                self.embedding_dim = getattr(cfg.model, "cond_emb_dim", 256) if cfg is not None else 256
 
     @abstractmethod
     def forward(self, *args, **kwargs):

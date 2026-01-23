@@ -56,7 +56,11 @@ class MLPContextModule(BaseContextModule):
 
         self.classification_heads = nn.ModuleDict(
             {
-                var_name: nn.Linear(embedding_dim, num_categories)
+                var_name: nn.Sequential(
+                    nn.Linear(embedding_dim, embedding_dim),
+                    nn.ReLU(),
+                    nn.Linear(embedding_dim, num_categories)
+                )
                 for var_name, num_categories in context_vars.items()
             }
         )
@@ -155,7 +159,11 @@ class SepMLPContextModule(BaseContextModule):
 
         self.classification_heads = nn.ModuleDict(
             {
-                var_name: nn.Linear(embedding_dim, num_categories)
+                var_name: nn.Sequential(
+                    nn.Linear(embedding_dim, embedding_dim),
+                    nn.ReLU(),
+                    nn.Linear(embedding_dim, num_categories)
+                )
                 for var_name, num_categories in self.categorical_vars.items()
             }
         )
@@ -163,7 +171,11 @@ class SepMLPContextModule(BaseContextModule):
         # Regression heads for continuous variables (output single value for MSE loss)
         self.regression_heads = nn.ModuleDict(
             {
-                var_name: nn.Linear(embedding_dim, 1)
+                var_name: nn.Sequential(
+                    nn.Linear(embedding_dim, embedding_dim),
+                    nn.ReLU(),
+                    nn.Linear(embedding_dim, 1)
+                )
                 for var_name in self.continuous_vars
             }
         )

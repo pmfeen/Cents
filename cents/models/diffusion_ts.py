@@ -53,7 +53,9 @@ class Diffusion_TS(GenerativeModel):
         self.context_reconstruction_loss_weight = (
             cfg.model.context_reconstruction_loss_weight
         )
-        _ = self.context_module
+        # Verify context modules are initialized (static, dynamic, or both)
+        if not hasattr(self, 'static_context_module') and not hasattr(self, 'dynamic_context_module'):
+            raise ValueError("At least one context module (static or dynamic) must be initialized")
 
         # linear layer for denoised output
         self.fc = nn.Linear(
@@ -142,6 +144,72 @@ class Diffusion_TS(GenerativeModel):
         self.continuous_context_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "continuous"]
         self.categorical_context_vars = [k for k, v in cfg.dataset.context_vars.items() if v[0] == "categorical"]
 
+    def _get_context_embedding(self, context_vars: dict) -> Tuple[torch.Tensor, dict]:
+        """
+        Get combined context embedding from static and/or dynamic context modules.
+        
+        Args:
+            context_vars: Dict of context tensors (static: single values, dynamic: time series)
+            
+        Returns:
+            embedding: Combined embedding tensor of shape (batch_size, embedding_dim)
+            all_logits: Dict of classification/regression logits from both modules
+        """
+        embeddings = []
+        all_logits = {}
+        
+        # Process static context variables
+        if self.static_context_module is not None:
+            # Filter static context variables
+            static_vars = {
+                k: v for k, v in context_vars.items()
+                if k not in getattr(self, 'dynamic_context_vars', [])
+            }
+            if static_vars:
+                device = next(self.static_context_module.parameters()).device
+                static_vars = {
+                    k: v.to(device, non_blocking=False) if isinstance(v, torch.Tensor) else v
+                    for k, v in static_vars.items()
+                }
+                static_embedding, static_logits = self.static_context_module(static_vars)
+                embeddings.append(static_embedding)
+                all_logits.update(static_logits)
+        
+        # Process dynamic context variables
+        if self.dynamic_context_module is not None:
+            # Filter dynamic context variables
+            dynamic_var_names = getattr(self, 'dynamic_context_vars', [])
+            dynamic_vars = {
+                k: v for k, v in context_vars.items()
+                if k in dynamic_var_names
+            }
+            if dynamic_vars:
+                device = next(self.dynamic_context_module.parameters()).device
+                dynamic_vars = {
+                    k: v.to(device, non_blocking=False) if isinstance(v, torch.Tensor) else v
+                    for k, v in dynamic_vars.items()
+                }
+                dynamic_embedding, dynamic_logits = self.dynamic_context_module(dynamic_vars)
+                # Check for NaN in dynamic embedding
+                if torch.isnan(dynamic_embedding).any() or torch.isinf(dynamic_embedding).any():
+                    raise ValueError(
+                        f"NaN/Inf detected in dynamic embedding. "
+                        f"Dynamic vars: {list(dynamic_vars.keys())}"
+                    )
+                embeddings.append(dynamic_embedding)
+                all_logits.update(dynamic_logits)
+        
+        # Combine embeddings if both exist
+        if len(embeddings) == 2:
+            combined = torch.cat(embeddings, dim=1)
+            embedding = self.combine_mlp(combined)
+        elif len(embeddings) == 1:
+            embedding = embeddings[0]
+        else:
+            raise ValueError("No context variables provided")
+        
+        return embedding, all_logits
+
     def predict_noise_from_start(
         self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor
     ) -> torch.Tensor:
@@ -218,7 +286,7 @@ class Diffusion_TS(GenerativeModel):
         """
         b = x.shape[0]
         t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
-        embedding, cond_classification_logits = self.context_module(context_vars)
+        embedding, cond_classification_logits = self._get_context_embedding(context_vars)
         
         # Check embedding for NaN/Inf and extreme values
         # if embedding.isnan().any() or embedding.isinf().any():
@@ -301,7 +369,6 @@ class Diffusion_TS(GenerativeModel):
 
         for var_name, outputs in cond_class_logits.items():
             labels = cond_batch[var_name]
-            
             if var_name in self.continuous_context_vars:
                 loss = F.mse_loss(outputs, labels.float())
             elif var_name in self.categorical_context_vars:
@@ -314,7 +381,9 @@ class Diffusion_TS(GenerativeModel):
             #     print(loss)
             #     print(outputs.mean(), labels.mean())
 
-        h, _ = self.context_module(cond_batch)
+        cond_loss /= len(cond_class_logits)
+
+        h, _ = self._get_context_embedding(cond_batch)
         tc_term = (
             self.cfg.model.tc_loss_weight * total_correlation(h)
             if self.cfg.model.tc_loss_weight > 0.0
@@ -325,12 +394,35 @@ class Diffusion_TS(GenerativeModel):
             rec_loss + self.context_reconstruction_loss_weight * cond_loss + tc_term
         )
         
-        # # Check for NaN in total loss
-        # if torch.isnan(total_loss) or torch.isinf(total_loss):
-        #     raise ValueError(
-        #         f"NaN/Inf detected in total_loss at batch {batch_idx}. "
-        #         f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss:.6f}, tc_term: {tc_term.item():.6f}"
-        #     )
+        # Check for NaN in total loss
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            raise ValueError(
+                f"NaN/Inf detected in total_loss at batch {batch_idx}. "
+                f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss.item():.6f}, tc_term: {tc_term.item():.6f}"
+            )
+        
+        # Debug: Check if context module parameters are getting gradients
+        # (only log occasionally to avoid spam)
+        if batch_idx % 50 == 0:
+            context_params_with_grad = []
+            context_params_no_grad = []
+            if self.static_context_module is not None:
+                for name, param in self.static_context_module.named_parameters():
+                    if param.requires_grad:
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            context_params_with_grad.append((name, grad_norm))
+                        else:
+                            context_params_no_grad.append(name)
+            
+            if context_params_no_grad:
+                print(f"[Warning] {len(context_params_no_grad)} context module parameters have no gradients!")
+                print(f"  No grad params: {context_params_no_grad[:5]}...")
+            if context_params_with_grad:
+                avg_grad_norm = sum(g[1] for g in context_params_with_grad) / len(context_params_with_grad)
+                max_grad_norm = max(g[1] for g in context_params_with_grad)
+                print(f"[Debug] Context module gradients: avg_norm={avg_grad_norm:.6f}, max_norm={max_grad_norm:.6f}")
+        
         self.log_dict(
             {
                 "train_loss": total_loss.item(),
@@ -466,7 +558,7 @@ class Diffusion_TS(GenerativeModel):
             Generated samples tensor.
         """
         x = torch.randn(shape, device=self.device)
-        embedding, _ = self.context_module(context_vars)
+        embedding, _ = self._get_context_embedding(context_vars)
         for t in reversed(range(self.num_timesteps)):
             x = self.p_sample(x, t, embedding)
         return x
@@ -479,7 +571,7 @@ class Diffusion_TS(GenerativeModel):
         Faster sampling using a reduced number of timesteps.
         """
         x = torch.randn(shape, device=self.device)
-        embedding, _ = self.context_module(context_vars)
+        embedding, _ = self._get_context_embedding(context_vars)
         times = torch.linspace(
             -1, self.num_timesteps - 1, steps=self.sampling_timesteps + 1
         )
