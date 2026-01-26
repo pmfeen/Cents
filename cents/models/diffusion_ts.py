@@ -401,28 +401,6 @@ class Diffusion_TS(GenerativeModel):
                 f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss.item():.6f}, tc_term: {tc_term.item():.6f}"
             )
         
-        # Debug: Check if context module parameters are getting gradients
-        # (only log occasionally to avoid spam)
-        if batch_idx % 50 == 0:
-            context_params_with_grad = []
-            context_params_no_grad = []
-            if self.static_context_module is not None:
-                for name, param in self.static_context_module.named_parameters():
-                    if param.requires_grad:
-                        if param.grad is not None:
-                            grad_norm = param.grad.norm().item()
-                            context_params_with_grad.append((name, grad_norm))
-                        else:
-                            context_params_no_grad.append(name)
-            
-            if context_params_no_grad:
-                print(f"[Warning] {len(context_params_no_grad)} context module parameters have no gradients!")
-                print(f"  No grad params: {context_params_no_grad[:5]}...")
-            if context_params_with_grad:
-                avg_grad_norm = sum(g[1] for g in context_params_with_grad) / len(context_params_with_grad)
-                max_grad_norm = max(g[1] for g in context_params_with_grad)
-                print(f"[Debug] Context module gradients: avg_norm={avg_grad_norm:.6f}, max_norm={max_grad_norm:.6f}")
-        
         self.log_dict(
             {
                 "train_loss": total_loss.item(),
@@ -460,6 +438,52 @@ class Diffusion_TS(GenerativeModel):
             beta=self.cfg.model.ema_decay,
             update_every=self.cfg.model.ema_update_interval,
         )
+
+    def on_after_backward(self) -> None:
+        """
+        Check gradients after backward pass but before optimizer step.
+        This is the right place to inspect gradients before they're zeroed.
+        """
+        # Get current batch index from trainer
+        if not hasattr(self.trainer, 'global_step'):
+            return
+        
+        batch_idx = self.trainer.global_step
+        
+        # Debug: Check if context module parameters are getting gradients
+        # Check AFTER backward pass but BEFORE optimizer step (only log occasionally)
+        if batch_idx % 50 == 0:
+            context_params_with_grad = []
+            context_params_no_grad = []
+            if self.static_context_module is not None:
+                for name, param in self.static_context_module.named_parameters():
+                    if param.requires_grad:
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            # Check for NaN/Inf gradients
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"[Warning] NaN/Inf gradients detected in {name}")
+                            else:
+                                context_params_with_grad.append((name, grad_norm))
+                        else:
+                            context_params_no_grad.append(name)
+            
+            if context_params_no_grad:
+                # Group by variable name to identify which context variables are missing
+                missing_vars = set()
+                for param_name in context_params_no_grad:
+                    # Extract variable name from parameter name (e.g., "context_embeddings.year.weight" -> "year")
+                    parts = param_name.split('.')
+                    if len(parts) >= 2 and parts[0] in ['context_embeddings', 'init_mlps']:
+                        missing_vars.add(parts[1])
+                print(f"[Warning] {len(context_params_no_grad)} context module parameters have no gradients!")
+                if missing_vars:
+                    print(f"  Missing context variables: {sorted(missing_vars)}")
+                print(f"  No grad params (sample): {context_params_no_grad[:5]}...")
+            if context_params_with_grad:
+                avg_grad_norm = sum(g[1] for g in context_params_with_grad) / len(context_params_with_grad)
+                max_grad_norm = max(g[1] for g in context_params_with_grad)
+                print(f"[Debug] Context module gradients: avg_norm={avg_grad_norm:.6f}, max_norm={max_grad_norm:.6f}")
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         """

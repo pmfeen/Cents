@@ -84,21 +84,26 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default="pecanstreet")
     parser.add_argument("--epochs", type=int, default=5000)
     parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--wandb-enabled", type=bool, default=False)
+    parser.add_argument("--wandb-enabled", action="store_true",
+                        help="Enable Weights and Biases logging")
     parser.add_argument("--wandb-project", type=str, default="cents")
     parser.add_argument("--wandb-entity", type=str, default=None)
-    parser.add_argument("--eval_after_training", type=bool, default=True)
-    parser.add_argument("--skip_heavy_processing", type=bool, default=True)
+    parser.add_argument("--eval_after_training", action="store_true",
+                        help="Evaluate after training")
+    parser.add_argument("--skip_heavy_processing", action="store_true",
+                        help="Skip heavy processing of dataset")
     parser.add_argument("--ddp-strategy", type=str, default="ddp_find_unused_parameters_false")
-    parser.add_argument("--enable_checkpointing", type=bool, default=True)
+    parser.add_argument("--enable_checkpointing", action="store_true",
+                        help="Enable checkpointing")
     parser.add_argument("--context-config-path", type=str, default=None, 
                         help="Path to custom context config YAML file (optional)")
     parser.add_argument("--context-overrides", type=str, nargs="*", default=[],
                         help="Override context config values (e.g., 'static_context.type=mlp' 'dynamic_context.type=cnn')")
-    parser.add_argument("--force-retrain-normalizer", type=bool, default=False,
+    parser.add_argument("--force-retrain-normalizer", action="store_true",
                         help="Force retraining of normalizer even if cached version exists")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None,
-                        help="Path to checkpoint file (.ckpt) to resume training from")
+        help="Path to checkpoint file (.ckpt) to resume training from", 
+    )
 
     args = parser.parse_args()
     main(args)

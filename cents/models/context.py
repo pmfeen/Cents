@@ -213,7 +213,8 @@ class SepMLPContextModule(BaseContextModule):
         embeddings = []        
         # Apply init MLPs to categorical variables
         for name, layer in self.init_mlps.items():
-            embeddings.append(layer(encodings[name]))
+            if name in encodings:
+                embeddings.append(layer(encodings[name]))
         
         # Apply init MLPs to continuous variables
         for name, layer in self.continuous_init_mlps.items():
@@ -254,12 +255,14 @@ class SepMLPContextModule(BaseContextModule):
         classification_logits = {
             var_name: head(embedding)
             for var_name, head in self.classification_heads.items()
+            if var_name in context_vars
         }
         
         # Regression outputs for continuous variables
         regression_outputs = {
             var_name: head(embedding).squeeze(-1)  # Remove last dim to get (batch_size,)
             for var_name, head in self.regression_heads.items()
+            if var_name in context_vars
         }
         
         # Combine both into a single dict for backward compatibility
