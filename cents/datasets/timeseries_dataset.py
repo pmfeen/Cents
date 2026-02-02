@@ -123,6 +123,7 @@ class TimeSeriesDataset(Dataset):
         if self.normalize:
             self._init_normalizer()
             cache_path = self._get_normalization_cache_path()
+            print("CACHE PATH", cache_path)
             if cache_path.exists():
                 print(f"[{'DDP Subprocess' if is_ddp_subprocess else 'Main Process'}] Loading pre-normalized data from cache")
                 with open(cache_path, 'rb') as f:
@@ -243,13 +244,7 @@ class TimeSeriesDataset(Dataset):
         """
         continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
 
-        # for col in continuous_vars:
-        #     if col in self.data.columns:
-        #         print(self.data[col].mean())
         self._normalize_continuous_vars()
-        # for col in continuous_vars:
-        #     if col in self.data.columns:
-        #         print(self.data[col].mean())
         return DataLoader(
             self, batch_size=batch_size, shuffle=shuffle, num_workers=8, persistent_workers=persistent_workers
         )

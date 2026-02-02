@@ -284,43 +284,54 @@ class Diffusion_TS(GenerativeModel):
             rec_loss: Reconstruction loss tensor.
             cond_logits: Classification logits dict from context module.
         """
+        # Check input x for extreme values
+        # if x.abs().max() > 100.0:
+        #     print(f"[Warning] Input x has extreme values: min={x.min():.4f}, max={x.max():.4f}, "
+        #           f"mean={x.mean():.4f}, std={x.std():.4f}, shape={x.shape}")
+        
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            raise ValueError(f"NaN/Inf detected in input x. Shape: {x.shape}, "
+                           f"NaN count: {torch.isnan(x).sum()}, Inf count: {torch.isinf(x).sum()}")
+        
         b = x.shape[0]
         t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
         embedding, cond_classification_logits = self._get_context_embedding(context_vars)
         
-        # Check embedding for NaN/Inf and extreme values
-        # if embedding.isnan().any() or embedding.isinf().any():
-        #     raise ValueError(
-        #         f"NaN/Inf detected in embedding from context module. "
-        #         f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}"
-        #     )
+        # Check embedding for NaN/Inf
+        if embedding.isnan().any() or embedding.isinf().any():
+            raise ValueError(
+                f"NaN/Inf detected in embedding from context module. "
+                f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}, "
+                f"shape: {embedding.shape}, min: {embedding.min()}, max: {embedding.max()}"
+            )
         
-        # Clamp extreme values to prevent numerical instability in transformer
-        # Don't fully normalize as that would change the learned embedding scale
-        # Just clip extreme outliers that could cause issues in attention/Fourier operations
-        # embedding_clamped = torch.clamp(embedding, min=-50.0, max=50.0)
+        # Embedding should now be normalized by the context module (mean=0, std=1 per sample)
+        # Check that values are in reasonable range
+        if embedding.abs().max() > 100.0:
+            print(f"[Warning] Embedding has large values despite normalization: "
+                  f"min={embedding.min():.4f}, max={embedding.max():.4f}, "
+                  f"mean={embedding.mean():.4f}, std={embedding.std():.4f}")
         
-        # # Log if clamping occurred (for debugging)
-        # if (embedding != embedding_clamped).any():
-        #     n_clamped = (embedding != embedding_clamped).sum().item()
-        #     print(f"[Warning] Clamped {n_clamped} embedding values. "
-        #           f"Original range: [{embedding.min():.4f}, {embedding.max():.4f}], "
-        #           f"Clamped range: [{embedding_clamped.min():.4f}, {embedding_clamped.max():.4f}]")
-        
-        # embedding_normalized = embedding_clamped
-        
+        # Check diffusion schedule parameters
         noise = torch.randn_like(x)
+        
         x_noisy = (
             self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * x
             + self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * noise
         )
-
-        # if x_noisy.isnan().any(): 
-        #     raise ValueError("NaN detected in x_noisy")
+        
+        if x_noisy.isnan().any() or x_noisy.isinf().any(): 
+            raise ValueError(f"NaN/Inf detected in x_noisy. Shape: {x_noisy.shape}, "
+                           f"NaN count: {torch.isnan(x_noisy).sum()}, Inf count: {torch.isinf(x_noisy).sum()}")
         
         # Use normalized embedding for concatenation
         embedding_expanded = embedding.unsqueeze(1).repeat(1, self.seq_len, 1)
         c = torch.cat([x_noisy, embedding_expanded], dim=-1)
+        
+        if c.isnan().any() or c.isinf().any():
+            raise ValueError(f"NaN/Inf detected in concatenated input 'c'. "
+                           f"Shape: {c.shape}, x_noisy stats: min={x_noisy.min():.4f}, max={x_noisy.max():.4f}, "
+                           f"embedding stats: min={embedding.min():.4f}, max={embedding.max():.4f}")
 
         # if c.isnan().any() or c.isinf().any():
         #     raise ValueError(
@@ -332,21 +343,8 @@ class Diffusion_TS(GenerativeModel):
         #         f"max={embedding.max():.4f}"
         #     )
 
-        # if t.isnan().any():
-        #     raise ValueError("NaN detected in timestep 't'")
-
         trend, season = self.model(c, t, padding_masks=None)
-        # if trend.isnan().any():
-        #     print("trend")
-
-        # if season.isnan().any():
-        #     print("season")
         x_recon = self.fc(trend + season)
-        # if x_recon.isnan().any():
-        #     print("X RECON")
-        # if x.isnan().any():
-        #     print("x")
-        # print("REC LOSS", x_recon, x)
         rec_loss = self.recon_loss_fn(x_recon, x)
         return rec_loss, cond_classification_logits
 
@@ -367,21 +365,22 @@ class Diffusion_TS(GenerativeModel):
         cond_loss = 0.0
 
 
-        for var_name, outputs in cond_class_logits.items():
-            labels = cond_batch[var_name]
-            if var_name in self.continuous_context_vars:
-                loss = F.mse_loss(outputs, labels.float())
-            elif var_name in self.categorical_context_vars:
-                loss = self.auxiliary_loss(outputs, labels)
+        # for var_name, outputs in cond_class_logits.items():
+        #     labels = cond_batch[var_name]
+        #     if var_name in self.continuous_context_vars:
+        #         loss = F.mse_loss(outputs, labels.float())
+        #     elif var_name in self.categorical_context_vars:
+        #         loss = self.auxiliary_loss(outputs, labels)
             
-            cond_loss += loss.mean()
+        #     cond_loss += loss.mean()
 
-            # if var_name in self.continuous_context_vars:
-            #     print(var_name)
-            #     print(loss)
-            #     print(outputs.mean(), labels.mean())
+        #     # if var_name in self.continuous_context_vars:
+        #     #     print(var_name)
+        #     #     print(loss)
+        #     #     print(outputs.mean(), labels.mean())
 
-        cond_loss /= len(cond_class_logits)
+        
+        # cond_loss /= len(cond_class_logits)
 
         h, _ = self._get_context_embedding(cond_batch)
         tc_term = (
@@ -398,14 +397,14 @@ class Diffusion_TS(GenerativeModel):
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             raise ValueError(
                 f"NaN/Inf detected in total_loss at batch {batch_idx}. "
-                f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss.item():.6f}, tc_term: {tc_term.item():.6f}"
+                f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss:.6f}, tc_term: {tc_term.item():.6f}"
             )
         
         self.log_dict(
             {
                 "train_loss": total_loss.item(),
                 "rec_loss": rec_loss.item(),
-                "cond_loss": cond_loss.item(),
+                # "cond_loss": cond_loss.item(),
                 "tc_loss": tc_term,
             },
             prog_bar=True,

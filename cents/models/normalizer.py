@@ -277,11 +277,11 @@ class Normalizer(NormalizerModel):
         self.dataset = dataset
 
         # Get continuous variables from config if specified
-        continuous_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "continuous"]
-        categorical_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "categorical"]
+        self.continuous_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "continuous"]
+        self.categorical_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "categorical"]
         dynamic_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "time_series"]
         
-        self.static_context_vars = categorical_vars + continuous_vars
+        self.static_context_vars = self.categorical_vars + self.continuous_vars
         self.dynamic_context_vars = dynamic_vars
         self.context_vars = self.static_context_vars + self.dynamic_context_vars
         
@@ -291,6 +291,7 @@ class Normalizer(NormalizerModel):
         self.time_series_dims = dataset_cfg.time_series_dims
         self.do_scale = dataset_cfg.scale
         self.seq_len = dataset_cfg.seq_len
+        self.num_ts_steps = getattr(dataset_cfg, "num_ts_steps", None)  # For dynamic context length
 
         # Get context config
         # context_cfg = get_context_config()
@@ -315,7 +316,7 @@ class Normalizer(NormalizerModel):
                 self.static_context_vars_dict,
                 256,
             )
-        
+
         # Create dynamic context module (for time_series)
         dynamic_context_module = None
         if self.dynamic_context_vars and self.dynamic_module_type is not None:
@@ -325,10 +326,12 @@ class Normalizer(NormalizerModel):
                 k: v for k, v in self.dataset_cfg.context_vars.items() 
                 if k in self.dynamic_context_vars
             }
+            # Use num_ts_steps for dynamic context length if available, otherwise seq_len
+            dynamic_seq_len = self.num_ts_steps if self.num_ts_steps is not None else self.seq_len
             dynamic_context_module = DynamicContextModuleCls(
                 dynamic_context_vars_dict,
                 256,
-                seq_len=self.seq_len,
+                seq_len=dynamic_seq_len,
             )
         
         self.normalizer_model = _NormalizerModule(
@@ -347,7 +350,7 @@ class Normalizer(NormalizerModel):
         self.dynamic_cond_module = self.normalizer_model.dynamic_cond_module
 
         # Will be populated in setup()
-        self.group_stats = {}
+        self.sample_stats = []
         self._verify_parameters()
 
     def _verify_parameters(self):
@@ -372,9 +375,10 @@ class Normalizer(NormalizerModel):
 
     def setup(self, stage: Optional[str] = None):
         """
-        Lightning hook: compute group statistics before training.
+        Lightning hook: prepare training data before training.
         """
-        self.group_stats = self._compute_group_stats()
+        # Compute per-sample statistics - no grouping needed
+        self.sample_stats = self._compute_per_sample_stats()
         
         # Log initial predictions to check if model is in the right ballpark
         if stage == "fit" or stage is None:
@@ -611,44 +615,56 @@ class Normalizer(NormalizerModel):
             pin_memory=torch.cuda.is_available(),  # Helps with GPU transfer
             prefetch_factor=2,  # Reduce prefetch to avoid memory issues
         )
-    # def on_after_backward(self):
-    #     unused = [n for n,p in self.named_parameters() if p.requires_grad and p.grad is None]
-    #     if unused:
-    #         print("UNUSED:", unused[:50])
 
-    def _compute_group_stats(self) -> dict:
+    def _compute_per_sample_stats(self) -> list:
         """
-        Compute per-group (context combination) statistics from raw data.
+        Compute statistics for each individual sample.
+        This allows the model to learn context → normalization_params for all context types
+        (categorical, continuous, and dynamic) without requiring grouping.
 
         Returns:
-            Mapping from context tuple to (mu_array, std_array, zmin_array, zmax_array, dynamic_ctx_dict).
+            List of tuples: (context_vars_dict, mu_array, std_array, zmin_array, zmax_array)
         """
         df = self.dataset.data.copy()
-        grouped_stats = {}
-        for group_vals, group_df in df.groupby(self.static_context_vars):
-            dimension_points = [[] for _ in range(self.time_series_dims)]
-            # Store dynamic context variables (time series) for this group
-            # We'll use the first row's dynamic context as representative
-            dynamic_ctx_dict = {}
-            if self.dynamic_context_vars:
-                first_row = group_df.iloc[0]
-                for var_name in self.dynamic_context_vars:
-                    if var_name in first_row:
-                        # Get the time series sequence
-                        ts_data = first_row[var_name]
-                        if isinstance(ts_data, np.ndarray):
-                            dynamic_ctx_dict[var_name] = ts_data
-                        elif isinstance(ts_data, list):
-                            dynamic_ctx_dict[var_name] = np.array(ts_data)
-                        else:
-                            # If it's a scalar, repeat it to match seq_len
-                            dynamic_ctx_dict[var_name] = np.full(self.seq_len, ts_data)
+        sample_stats = []
+        continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
+        
+        for idx, row in df.iterrows():
+            context_vars_dict = {}
             
-            for _, row in group_df.iterrows():
-                for d, col_name in enumerate(self.time_series_cols):
-                    arr = np.array(row[col_name], dtype=np.float32).flatten()
-                    dimension_points[d].append(arr)
-            dimension_points = [np.concatenate(d, axis=0) for d in dimension_points]
+            # Process static context variables (categorical + continuous)
+            for var_name in self.static_context_vars:
+                if var_name in row:
+                    if var_name in continuous_vars:
+                        context_vars_dict[var_name] = torch.tensor(row[var_name], dtype=torch.float32)
+                    else:
+                        context_vars_dict[var_name] = torch.tensor(row[var_name], dtype=torch.long)
+            
+            # Process dynamic context variables (time series)
+            dynamic_ctx_dict = {}
+            for var_name in self.dynamic_context_vars:
+                # Check for both the original name and context_ prefix (vehicle dataset uses context_ prefix)
+                ts_data = None
+                if var_name in row:
+                    ts_data = row[var_name]
+                
+                if ts_data is not None:
+                    if isinstance(ts_data, np.ndarray):
+                        dynamic_ctx_dict[var_name] = ts_data
+                    elif isinstance(ts_data, list):
+                        dynamic_ctx_dict[var_name] = np.array(ts_data)
+                    else:
+                        # If it's a scalar, repeat it to match the appropriate length
+                        # Use num_ts_steps if available (for dynamic context), otherwise seq_len
+                        context_len = self.num_ts_steps if self.num_ts_steps is not None else self.seq_len
+                        dynamic_ctx_dict[var_name] = np.full(context_len, ts_data)
+            
+            # Compute statistics from this sample's target time series
+            dimension_points = []
+            for d, col_name in enumerate(self.time_series_cols):
+                arr = np.array(row[col_name], dtype=np.float32).flatten()
+                dimension_points.append(arr)
+            
             mu_array = np.array(
                 [pts.mean() for pts in dimension_points], dtype=np.float32
             )
@@ -673,47 +689,34 @@ class Normalizer(NormalizerModel):
                 )
             else:
                 z_min_array = z_max_array = None
-
-            grouped_stats[tuple(group_vals)] = (
+            
+            sample_stats.append((
+                context_vars_dict,
+                dynamic_ctx_dict,
                 mu_array,
                 std_array,
                 z_min_array,
                 z_max_array,
-                dynamic_ctx_dict,
-            )
-        return grouped_stats
+            ))
+        
+        return sample_stats
 
     def _create_training_dataset(self) -> Dataset:
         """
-        Build an internal Dataset yielding true stats for each context group.
+        Build an internal Dataset yielding per-sample statistics.
 
         Returns:
             PyTorch Dataset of samples (context_vars_dict, mu, sigma, zmin, zmax).
         """
-        data_tuples = [
-            (ctx_tuple, mu_arr, sigma_arr, zmin_arr, zmax_arr, dynamic_ctx_dict)
-            for ctx_tuple, (
-                mu_arr,
-                sigma_arr,
-                zmin_arr,
-                zmax_arr,
-                dynamic_ctx_dict,
-            ) in self.group_stats.items()
-        ]
-
-        continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
-        
         class _TrainSet(Dataset):
             """
-            Adapter Dataset to wrap group_stats tuples for DataLoader.
+            Adapter Dataset to wrap per-sample statistics for DataLoader.
             """
 
-            def __init__(self, samples, static_context_vars, dynamic_context_vars, do_scale, continuous_vars, dataset_cfg):
+            def __init__(self, samples, dynamic_context_vars, do_scale, dataset_cfg):
                 self.samples = samples
-                self.static_context_vars = static_context_vars
                 self.dynamic_context_vars = dynamic_context_vars
                 self.do_scale = do_scale
-                self.continuous_vars = continuous_vars
                 self.dataset_cfg = dataset_cfg
 
             def __len__(self) -> int:
@@ -733,17 +736,9 @@ class Normalizer(NormalizerModel):
                     zmin_t: True min z-score tensor or None.
                     zmax_t: True max z-score tensor or None.
                 """
-                ctx_tuple, mu_arr, sigma_arr, zmin_arr, zmax_arr, dynamic_ctx_dict = self.samples[idx]
-                context_vars_dict = {}
+                context_vars_dict, dynamic_ctx_dict, mu_arr, sigma_arr, zmin_arr, zmax_arr = self.samples[idx]
                 
-                # Process static context variables
-                for i, var_name in enumerate(self.static_context_vars):
-                    if var_name in self.continuous_vars:
-                        context_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.float32)
-                    else:
-                        context_vars_dict[var_name] = torch.tensor(ctx_tuple[i], dtype=torch.long)
-                
-                # Process dynamic context variables (time series)
+                # Process dynamic context variables (time series) - convert to tensors
                 for var_name in self.dynamic_context_vars:
                     if var_name in dynamic_ctx_dict:
                         ts_data = dynamic_ctx_dict[var_name]
@@ -772,7 +767,7 @@ class Normalizer(NormalizerModel):
                 zmax_t = torch.from_numpy(zmax_arr).float() if self.do_scale else None
                 return context_vars_dict, mu_t, sigma_t, zmin_t, zmax_t
 
-        return _TrainSet(data_tuples, self.static_context_vars, self.dynamic_context_vars, self.do_scale, continuous_vars, self.dataset_cfg)
+        return _TrainSet(self.sample_stats, self.dynamic_context_vars, self.do_scale, self.dataset_cfg)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """

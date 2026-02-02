@@ -70,6 +70,7 @@ class BaseModel(pl.LightningModule, ABC):
                 # Create dynamic context module (for time_series)
                 self.dynamic_context_module = None
                 if self.dynamic_context_vars and dynamic_module_type is not None:
+                    num_ts_steps = getattr(cfg.dataset, "num_ts_steps", None)
                     DynamicContextModuleCls = get_context_module_cls("dynamic", dynamic_module_type)
                     dynamic_context_vars_dict = {
                         k: v for k, v in cfg.dataset.context_vars.items() 
@@ -81,7 +82,7 @@ class BaseModel(pl.LightningModule, ABC):
                     self.dynamic_context_module = DynamicContextModuleCls(
                         dynamic_context_vars_dict,
                         emb_dim,
-                        seq_len=seq_len,
+                        seq_len=seq_len if num_ts_steps is None else num_ts_steps,
                     )
                 
                 # Determine embedding dimension and create combine MLP if both exist

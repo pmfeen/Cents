@@ -4,6 +4,7 @@ import pandas as pd
 from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
 from cents.datasets.airquality import AirQualityDataset
+from cents.datasets.vehicle import VehicleDataset
 from cents.trainer import Trainer
 from cents.utils.utils import set_context_config_path, set_context_overrides
 from pytorch_lightning.callbacks import EarlyStopping
@@ -39,6 +40,11 @@ def main(args) -> None:
         )
     elif args.dataset == "airquality":
         dataset = AirQualityDataset(
+            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
+            force_retrain_normalizer=args.force_retrain_normalizer
+        )
+    elif args.dataset == "vehicle":
+        dataset = VehicleDataset(
             overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
             force_retrain_normalizer=args.force_retrain_normalizer
         )

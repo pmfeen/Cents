@@ -188,7 +188,6 @@ class SepMLPContextModule(BaseContextModule):
             if name in context_vars:
                 encodings[name] = layer(context_vars[name])
         
-        #print(encodings, "ENCODINGS")
         # Process continuous variables (only those present in context_vars)
         for name, layer in self.continuous_projections.items():
             if name in context_vars:
@@ -251,7 +250,6 @@ class SepMLPContextModule(BaseContextModule):
                 f"min={context_matrix.min():.4f}, max={context_matrix.max():.4f}"
             )
 
-        #print(embedding, "post mixing")
         classification_logits = {
             var_name: head(embedding)
             for var_name, head in self.classification_heads.items()
@@ -615,6 +613,12 @@ class DynamicContextModule_Transformer(BaseContextModule):
                 attention_weights = torch.softmax(attention_weights, dim=1)
                 pooled = (encoded * attention_weights).sum(dim=1)  # (batch, embedding_dim)
                 
+                # Normalize pooled embedding to prevent accumulation of large values
+                # Layer normalization: normalize across embedding dimension
+                pooled_mean = pooled.mean(dim=1, keepdim=True)  # (batch, 1)
+                pooled_std = pooled.std(dim=1, keepdim=True) + 1e-8  # (batch, 1)
+                pooled = (pooled - pooled_mean) / pooled_std
+                
                 embeddings.append(pooled)
         
         # Process numeric time series
@@ -633,8 +637,14 @@ class DynamicContextModule_Transformer(BaseContextModule):
                 # Replace NaN/Inf with zeros to prevent propagation
                 ts_data = torch.where(torch.isfinite(ts_data), ts_data, torch.zeros_like(ts_data))
                 
+                # Normalize input to prevent numerical overflow
+                # Compute per-sample statistics to normalize each time series independently
+                ts_mean = ts_data.mean(dim=1, keepdim=True)  # (batch, 1)
+                ts_std = ts_data.std(dim=1, keepdim=True) + 1e-8  # (batch, 1) - add epsilon to prevent division by zero
+                ts_data_normalized = (ts_data - ts_mean) / ts_std
+                
                 # Project to embedding_dim: (batch, seq_len) -> (batch, seq_len, embedding_dim)
-                ts_data_expanded = ts_data.unsqueeze(-1)  # (batch, seq_len, 1)
+                ts_data_expanded = ts_data_normalized.unsqueeze(-1)  # (batch, seq_len, 1)
                 embedded = self.ts_projections[name](ts_data_expanded)  # (batch, seq_len, embedding_dim)
                 
                 # Add positional encoding if available
@@ -660,6 +670,12 @@ class DynamicContextModule_Transformer(BaseContextModule):
                 attention_weights = torch.softmax(attention_weights, dim=1)
                 pooled = (encoded * attention_weights).sum(dim=1)  # (batch, embedding_dim)
                 
+                # Normalize pooled embedding to prevent accumulation of large values
+                # Layer normalization: normalize across embedding dimension
+                pooled_mean = pooled.mean(dim=1, keepdim=True)  # (batch, 1)
+                pooled_std = pooled.std(dim=1, keepdim=True) + 1e-8  # (batch, 1)
+                pooled = (pooled - pooled_mean) / pooled_std
+                
                 embeddings.append(pooled)
         
         if not embeddings:
@@ -674,9 +690,9 @@ class DynamicContextModule_Transformer(BaseContextModule):
         if torch.isnan(combined).any() or torch.isinf(combined).any():
             raise ValueError(f"NaN/Inf detected in combined embeddings before mixing MLP")
         embedding = self.mixing_mlp(combined)  # (batch, embedding_dim)
-        # Check for NaN after mixing
+        # Check for NaN after mixing and normalization
         if torch.isnan(embedding).any() or torch.isinf(embedding).any():
-            raise ValueError(f"NaN/Inf detected in final embedding after mixing MLP")
+            raise ValueError(f"NaN/Inf detected in final embedding after mixing MLP and normalization")
         
         return embedding, {}
 
