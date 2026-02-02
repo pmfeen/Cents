@@ -59,15 +59,12 @@ class TimeSeriesDataset(Dataset):
     ):
         # Initialize basic attributes
         # Handle OmegaConf ListConfig objects
-        if isinstance(time_series_column_names, ListConfig):
+        if not isinstance(time_series_column_names, list):
             time_series_column_names = list(time_series_column_names)
         if isinstance(context_var_column_names, ListConfig):
             context_var_column_names = list(context_var_column_names)
-        self.time_series_column_names = (
-            time_series_column_names
-            if isinstance(time_series_column_names, list)
-            else [time_series_column_names]
-        )
+
+        self.time_series_column_names = time_series_column_names
         self.time_series_dims = self.cfg.time_series_dims
         self.context_vars = context_var_column_names or []
         self.seq_len = seq_len
@@ -86,9 +83,12 @@ class TimeSeriesDataset(Dataset):
             self.cfg = cfg
 
         self.context_var_dict = self.cfg.context_vars
+        self.numeric_cols = [k for k, v in self.cfg.context_vars.items() if v[0] == "categorical" and v[1] is None]
         self.numeric_context_bins = self.cfg.numeric_context_bins
-        if not hasattr(self, "threshold"):
-            self.threshold = (-self.cfg.threshold, self.cfg.threshold)
+
+        for k in self.numeric_cols:
+            self.context_var_dict[k] = ["categorical", self.numeric_context_bins]
+
         if not hasattr(self, "name"):
             self.name = "custom"
 
@@ -123,9 +123,8 @@ class TimeSeriesDataset(Dataset):
         if self.normalize:
             self._init_normalizer()
             cache_path = self._get_normalization_cache_path()
-            print("CACHE PATH", cache_path)
             if cache_path.exists():
-                print(f"[{'DDP Subprocess' if is_ddp_subprocess else 'Main Process'}] Loading pre-normalized data from cache")
+                print(f"[{'DDP Subprocess' if is_ddp_subprocess else 'Main Process'}] Loading pre-normalized data from cache", cache_path)
                 with open(cache_path, 'rb') as f:
                     self.data = pickle.load(f)
             else:
@@ -347,16 +346,17 @@ class TimeSeriesDataset(Dataset):
         """
         continuous_vars = [k for k, v in self.cfg.context_vars.items() if v[0] == "continuous"]
         time_series_cols = [k for k, v in self.cfg.context_vars.items() if v[0] == "time_series"]
-        numeric_cols = [k for k, v in self.cfg.context_vars.items() if v[0] == "categorical" and v[1] == None]
         encoded_data, mapping = encode_context_variables(
             data=data,
             columns_to_encode=self.context_vars,
             bins=self.numeric_context_bins,
-            numeric_cols=numeric_cols,
+            numeric_cols=self.numeric_cols,
             continuous_vars=continuous_vars,
             time_series_cols=time_series_cols,
             categorical_time_series=self.categorical_time_series,
         )
+        print(mapping, "mapping")
+        print("ranges encode context vars")
         
         return encoded_data, mapping
 
@@ -700,7 +700,7 @@ class TimeSeriesDataset(Dataset):
             devices=ncfg.devices,
             strategy=ncfg.strategy,
             log_every_n_steps=ncfg.log_every_n_steps,
-            logger=True,
+            logger=False,
         )
         trainer.fit(self._normalizer)
         torch.save(self._normalizer.state_dict(), cache_path)

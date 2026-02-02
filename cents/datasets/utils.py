@@ -167,6 +167,7 @@ def encode_context_variables(
         elif col in time_series_cols or col in continuous_vars:
             continue
         elif numeric_cols and col in numeric_cols:
+            print("ENCODING NUMERIC COL", col)
             # Numeric column: Perform binning
             # Handle NaN values by filling with median before binning
             if encoded_data[col].isna().all():

@@ -90,6 +90,7 @@ class Trainer:
                 num_workers=6,  # Maximum for 7.5GB/10GB GPU usage
                 persistent_workers=True,
             )
+            print(f"[Cents] Training model on {len(train_loader)} batches")
             self.pl_trainer.fit(self.model, train_loader, None, ckpt_path=ckpt_path)
         return self
 

@@ -1,0 +1,24 @@
+name: vehicle
+normalize: False
+scale: False
+use_learned_normalizer: True
+seq_len: 15 # 1.5 s
+time_series_dims: 6
+shuffle: True
+skip_heavy_processing: False  # Skip rarity computation (for faster loading/DDP)
+max_samples: null  # Limit dataset size (null = use all data)
+path: "./data/vehicle"
+time_series_columns: ["Acceleration_pedal_depth", "Vehicle_speed", "Brake_pedal_depth", "Vehicle_acceleration", "VCU_MotTqCmd", "MCU_MotActTq"]
+data_columns: ["Time", "Acceleration_pedal_depth", "Vehicle_speed", "Brake_pedal_depth", "Vehicle_acceleration", "VCU_MotTqCmd", "MCU_MotActTq"]
+num_ts_steps: 5 #.5s
+numeric_context_bins: null
+
+context_vars:
+  context_Acceleration_pedal_depth: ["time_series", null]
+  context_Vehicle_speed: ["time_series", null]
+  context_Brake_pedal_depth: ["time_series", null]
+  context_Vehicle_acceleration: ["time_series", null]
+  context_VCU_MotTqCmd: ["time_series", null]
+  context_MCU_MotActTq: ["time_series", null]
+
+

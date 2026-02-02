@@ -206,8 +206,7 @@ class Diffusion_TS(GenerativeModel):
         elif len(embeddings) == 1:
             embedding = embeddings[0]
         else:
-            raise ValueError("No context variables provided")
-        
+            raise ValueError("No context variables provided")        
         return embedding, all_logits
 
     def predict_noise_from_start(
@@ -288,7 +287,6 @@ class Diffusion_TS(GenerativeModel):
         # if x.abs().max() > 100.0:
         #     print(f"[Warning] Input x has extreme values: min={x.min():.4f}, max={x.max():.4f}, "
         #           f"mean={x.mean():.4f}, std={x.std():.4f}, shape={x.shape}")
-        
         if torch.isnan(x).any() or torch.isinf(x).any():
             raise ValueError(f"NaN/Inf detected in input x. Shape: {x.shape}, "
                            f"NaN count: {torch.isnan(x).sum()}, Inf count: {torch.isinf(x).sum()}")
@@ -296,7 +294,6 @@ class Diffusion_TS(GenerativeModel):
         b = x.shape[0]
         t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
         embedding, cond_classification_logits = self._get_context_embedding(context_vars)
-        
         # Check embedding for NaN/Inf
         if embedding.isnan().any() or embedding.isinf().any():
             raise ValueError(
@@ -314,25 +311,20 @@ class Diffusion_TS(GenerativeModel):
         
         # Check diffusion schedule parameters
         noise = torch.randn_like(x)
-        
         x_noisy = (
             self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * x
             + self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * noise
         )
-        
         if x_noisy.isnan().any() or x_noisy.isinf().any(): 
             raise ValueError(f"NaN/Inf detected in x_noisy. Shape: {x_noisy.shape}, "
                            f"NaN count: {torch.isnan(x_noisy).sum()}, Inf count: {torch.isinf(x_noisy).sum()}")
-        
         # Use normalized embedding for concatenation
         embedding_expanded = embedding.unsqueeze(1).repeat(1, self.seq_len, 1)
         c = torch.cat([x_noisy, embedding_expanded], dim=-1)
-        
         if c.isnan().any() or c.isinf().any():
             raise ValueError(f"NaN/Inf detected in concatenated input 'c'. "
                            f"Shape: {c.shape}, x_noisy stats: min={x_noisy.min():.4f}, max={x_noisy.max():.4f}, "
                            f"embedding stats: min={embedding.min():.4f}, max={embedding.max():.4f}")
-
         # if c.isnan().any() or c.isinf().any():
         #     raise ValueError(
         #         f"NaN/Inf detected in concatenated input 'c'. "
@@ -342,7 +334,6 @@ class Diffusion_TS(GenerativeModel):
         #         f"std={embedding.std():.4f}, min={embedding.min():.4f}, "
         #         f"max={embedding.max():.4f}"
         #     )
-
         trend, season = self.model(c, t, padding_masks=None)
         x_recon = self.fc(trend + season)
         rec_loss = self.recon_loss_fn(x_recon, x)
@@ -365,14 +356,14 @@ class Diffusion_TS(GenerativeModel):
         cond_loss = 0.0
 
 
-        # for var_name, outputs in cond_class_logits.items():
-        #     labels = cond_batch[var_name]
-        #     if var_name in self.continuous_context_vars:
-        #         loss = F.mse_loss(outputs, labels.float())
-        #     elif var_name in self.categorical_context_vars:
-        #         loss = self.auxiliary_loss(outputs, labels)
+        for var_name, outputs in cond_class_logits.items():
+            labels = cond_batch[var_name]
+            if var_name in self.continuous_context_vars:
+                loss = F.mse_loss(outputs, labels.float())
+            elif var_name in self.categorical_context_vars:
+                loss = self.auxiliary_loss(outputs, labels)
             
-        #     cond_loss += loss.mean()
+            cond_loss += loss.mean()
 
         #     # if var_name in self.continuous_context_vars:
         #     #     print(var_name)
@@ -380,7 +371,7 @@ class Diffusion_TS(GenerativeModel):
         #     #     print(outputs.mean(), labels.mean())
 
         
-        # cond_loss /= len(cond_class_logits)
+        cond_loss /= len(cond_class_logits)
 
         h, _ = self._get_context_embedding(cond_batch)
         tc_term = (
@@ -404,7 +395,7 @@ class Diffusion_TS(GenerativeModel):
             {
                 "train_loss": total_loss.item(),
                 "rec_loss": rec_loss.item(),
-                # "cond_loss": cond_loss.item(),
+                "cond_loss": cond_loss.item(),
                 "tc_loss": tc_term,
             },
             prog_bar=True,
@@ -477,8 +468,9 @@ class Diffusion_TS(GenerativeModel):
                         missing_vars.add(parts[1])
                 print(f"[Warning] {len(context_params_no_grad)} context module parameters have no gradients!")
                 if missing_vars:
-                    print(f"  Missing context variables: {sorted(missing_vars)}")
-                print(f"  No grad params (sample): {context_params_no_grad[:5]}...")
+                    pass
+                    # print(f"  Missing context variables: {sorted(missing_vars)}")
+                # print(f"  No grad params (sample): {context_params_no_grad[:5]}...")
             if context_params_with_grad:
                 avg_grad_norm = sum(g[1] for g in context_params_with_grad) / len(context_params_with_grad)
                 max_grad_norm = max(g[1] for g in context_params_with_grad)

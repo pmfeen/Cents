@@ -15,6 +15,8 @@ data_columns: ["dataid","local_15min","car1","grid","solar"]
 metadata_columns: ["dataid","building_type","solar","car1","city","state","total_square_footage","house_construction_year"]
 user_group: all # non_pv_users, all, pv_users
 numeric_context_bins: 5
+normalizer_stats_mode: group
+
 
 context_vars:
   month: ["categorical", 12]
@@ -24,5 +26,5 @@ context_vars:
   car1: ["categorical", 2]
   city: ["categorical", 7]
   state: ["categorical", 3]
-  total_square_footage: ["continuous", null]
-  house_construction_year: ["continuous", null]
+  total_square_footage: ["categorical", null]
+  house_construction_year: ["categorical", null]

@@ -39,10 +39,9 @@ class MLPContextModule(BaseContextModule):
         """
         super().__init__()
         self.embedding_dim = embedding_dim
-
         self.context_embeddings = nn.ModuleDict(
             {
-                name: nn.Embedding(num_categories, embedding_dim)
+                name: nn.Embedding(num_categories[1], embedding_dim)
                 for name, num_categories in context_vars.items()
             }
         )
@@ -59,7 +58,7 @@ class MLPContextModule(BaseContextModule):
                 var_name: nn.Sequential(
                     nn.Linear(embedding_dim, embedding_dim),
                     nn.ReLU(),
-                    nn.Linear(embedding_dim, num_categories)
+                    nn.Linear(embedding_dim, num_categories[1])
                 )
                 for var_name, num_categories in context_vars.items()
             }
@@ -78,20 +77,37 @@ class MLPContextModule(BaseContextModule):
             embedding (Tensor): Combined embedding of shape (batch_size, embedding_dim).
             classification_logits (Dict[str, Tensor]): Logits per variable,
                 each of shape (batch_size, num_categories).
-        """        
+        """
+#    # At start of forward, before any embedding(context_vars[name])
+#         for name in context_vars:
+#             t = context_vars[name]
+#             if t.dtype in (torch.long, torch.int):
+#                 t_cpu = t.detach().cpu()
+#                 print(f"{name}: shape={t_cpu.shape}, min={t_cpu.min().item()}, max={t_cpu.max().item()}")
+#         print(context_vars.keys(), self.context_embeddings.keys(), "context_vars and context_embeddings")        
         embeddings = [
             layer(context_vars[name]) for name, layer in self.context_embeddings.items()
         ]
 
+        # print("max", embeddings[0].max(), "min", embeddings[0].min(), "mean", embeddings[0].mean(), "std", embeddings[0].std(), "nan", embeddings[0].isnan().sum(), "inf", embeddings[0].isinf().sum())
+        # print(embeddings, "embeddings")
+
         context_matrix = torch.cat(embeddings, dim=1)
         embedding = self.mlp(context_matrix)
+
+        # print("max", embedding.max(), "min", embedding.min(), "mean", embedding.mean(), "std", embedding.std(), "nan", embedding.isnan().sum(), "inf", embedding.isinf().sum())
+
+        # print(embedding, "embedding")
 
         classification_logits = {
             var_name: head(embedding)
             for var_name, head in self.classification_heads.items()
         }
 
+        # print(classification_logits, "classification_logits")
+
         return embedding, classification_logits
+
 @register_context_module("default", "sep_mlp")
 class SepMLPContextModule(BaseContextModule):
     def __init__(

@@ -1,7 +1,7 @@
 precision: "16-mixed"
 accelerator: auto
 devices: auto
-strategy: ddp_find_unused_parameters_false
+strategy: ddp_find_unused_parameters_true
 gradient_accumulate_every: 4
 log_every_n_steps: 1
 batch_size: 512

@@ -15,7 +15,6 @@ time_series_columns: "energy_meter"
 data_columns: ["dataid","energy_meter","timestamp"]
 metadata_columns: ["building_id", "site_id", "primaryspaceusage", "sqft", "yearbuilt"]
 numeric_context_bins: 5
-numeric_cols: ["sqft", "yearbuilt"]  # Columns to bin as numeric
 reduce_cardinality: False
 
 

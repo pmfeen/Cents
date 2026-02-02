@@ -98,7 +98,7 @@ if __name__ == "__main__":
                         help="Evaluate after training")
     parser.add_argument("--skip_heavy_processing", action="store_true",
                         help="Skip heavy processing of dataset")
-    parser.add_argument("--ddp-strategy", type=str, default="ddp_find_unused_parameters_false")
+    parser.add_argument("--ddp-strategy", type=str, default="ddp_find_unused_parameters_true")
     parser.add_argument("--enable_checkpointing", action="store_true",
                         help="Enable checkpointing")
     parser.add_argument("--context-config-path", type=str, default=None, 

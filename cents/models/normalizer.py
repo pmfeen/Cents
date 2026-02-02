@@ -61,33 +61,55 @@ class MLPStatsHead(nn.Module):
         # This helps with training stability
         self._initialize_output_layer()
     
-    def _initialize_output_layer(self):
-        """Initialize the output layer to reasonable starting values."""
-        # Get the last linear layer
-        output_layer = self.net[-1]
+    def _initialize_output_layer(self, init_sigma: float = 1.0):
+        """
+        Initialize the last layer so log_sigma starts around log(init_sigma).
+        Assumes outputs are later reshaped as out.view(B, K, D) where K=2 or 4.
+        Therefore log_sigma lives in the SECOND block: indices [D:2D) in the flattened vector.
+        """
+        assert init_sigma > 0.0, "init_sigma must be > 0"
+        D = self.time_series_dims
+        K = 4 if self.do_scale else 2
+
+        out_layer = self.net[-1]
+        if not isinstance(out_layer, nn.Linear):
+            raise RuntimeError("Expected last module in self.net to be nn.Linear")
+
         with torch.no_grad():
-            # Initialize all weights with small values
-            # nn.init.xavier_uniform_(output_layer.weight, gain=1.0)
-            
-            # Initialize all biases to zero first
-            # nn.init.zeros_(output_layer.bias)
-            
-            # For log_sigma outputs (indices 1, 3, 5, ...), initialize bias to small negative
-            # This makes exp(log_sigma) start around 0.1-1.0
-            if self.do_scale:
-                # Pattern: mu, log_sigma, z_min, z_max for each dimension
-                for dim_idx in range(self.time_series_dims):
-                    # log_sigma is at index 1 + 4*dim_idx
-                    log_sigma_idx = 1 + 4 * dim_idx
-                    # Initialize to 3.0: exp(3.0) ≈ 20, closer to typical sigma ~27
-                    output_layer.bias[log_sigma_idx].fill_(3.0)
-            else:
-                # Pattern: mu, log_sigma for each dimension
-                for dim_idx in range(self.time_series_dims):
-                    # log_sigma is at index 1 + 2*dim_idx
-                    log_sigma_idx = 1 + 2 * dim_idx
-                    # Initialize to 3.0: exp(3.0) ≈ 20, closer to typical sigma ~27
-                    output_layer.bias[log_sigma_idx].fill_(3.0)
+            # Reasonable default: keep biases at 0, then set log_sigma bias block.
+            nn.init.zeros_(out_layer.bias)
+
+            # Optional: small weights so output starts near the bias.
+            # (If you prefer PyTorch defaults, comment this out.)
+            nn.init.xavier_uniform_(out_layer.weight, gain=0.01)
+
+            # Set log_sigma block bias
+            log_sigma_bias = np.log(init_sigma)
+            start = 1 * D
+            end = 2 * D
+            out_layer.bias[start:end].fill_(log_sigma_bias)
+
+            # If you want, you can also bias z_min/z_max to plausible values here when do_scale=True
+            # Example (optional):
+            # if self.do_scale:
+            #     out_layer.bias[2*D:3*D].fill_(-2.0)  # z_min
+            #     out_layer.bias[3*D:4*D].fill_( 2.0)  # z_max
+
+        # Sanity: ensure output dimension matches expectation
+        expected_out = K * D
+        if out_layer.out_features != expected_out:
+            raise ValueError(
+                f"Output layer out_features={out_layer.out_features}, expected {expected_out} (K={K}, D={D})."
+            )
+
+    @staticmethod
+    def _soft_clamp_tanh(x: torch.Tensor, bound: float) -> torch.Tensor:
+        """
+        Smoothly maps x into [-bound, bound] using tanh.
+        """
+        if bound <= 0:
+            raise ValueError("bound must be > 0")
+        return bound * torch.tanh(x / bound)    
 
     def forward(self, z: torch.Tensor):
         """
@@ -121,10 +143,7 @@ class MLPStatsHead(nn.Module):
         # Store unclamped version for loss computation BEFORE clamping
         # This must be done before any operations that might break the computation graph
         pred_log_sigma_unclamped = pred_log_sigma
-        
-        # Clamp log_sigma to prevent exp() from producing infinity
-        # exp(88) ≈ 1.6e38 (near float32 max), so clamp to reasonable range
-        pred_log_sigma_clamped = torch.clamp(pred_log_sigma, min=-10.0, max=10.0)
+        pred_log_sigma_clamped = self._soft_clamp_tanh(pred_log_sigma, bound=10.0)
         pred_sigma = torch.exp(pred_log_sigma_clamped)
         return pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped
 
@@ -309,7 +328,7 @@ class Normalizer(NormalizerModel):
             StaticContextModuleCls = get_context_module_cls(self.static_module_type)
             # Filter context_vars to only static ones
             self.static_context_vars_dict = {
-                k: v for k, v in self.dataset_cfg.context_vars.items() 
+                k: v for k, v in self.dataset.context_var_dict.items() 
                 if k in self.static_context_vars
             }
             static_context_module = StaticContextModuleCls(
@@ -378,7 +397,8 @@ class Normalizer(NormalizerModel):
         Lightning hook: prepare training data before training.
         """
         # Compute per-sample statistics - no grouping needed
-        self.sample_stats = self._compute_per_sample_stats()
+        mode = getattr(self.dataset_cfg, "normalizer_stats_mode", "sample")
+        self.sample_stats = self._build_training_samples(mode, use_quantile_scale=False)
         
         # Log initial predictions to check if model is in the right ballpark
         if stage == "fit" or stage is None:
@@ -428,28 +448,18 @@ class Normalizer(NormalizerModel):
         return self.normalizer_model(cat_vars_dict)
 
     def _compute_loss_mse(self, pred_mu, pred_sigma, pred_log_sigma_unclamped, mu_t, sigma_t):
-        """
-        Compute MSE loss for mu and sigma.
-        
-        Args:
-            pred_mu: Predicted means
-            pred_sigma: Predicted standard deviations
-            pred_log_sigma_unclamped: Unclamped log sigma predictions
-            mu_t: Target means
-            sigma_t: Target standard deviations
-            
-        Returns:
-            loss_mu, loss_sigma
-        """
-        # Use standard MSE loss for mu
         loss_mu = F.mse_loss(pred_mu, mu_t)
         
-        # Use log-space loss for sigma - this is more numerically stable
-        # and handles scale differences better
-        target_log_sigma = torch.log(sigma_t + 1e-8)  # Add small epsilon to avoid log(0)
-        loss_sigma = F.mse_loss(pred_log_sigma_unclamped, target_log_sigma)
+        # FIX: Clamp the target log sigma to a reasonable range 
+        # (e.g., nothing smaller than e^-5 approx 0.006)
+        target_log_sigma = torch.log(sigma_t + 1e-8)
+        target_log_sigma = torch.clamp(target_log_sigma, min=-5.0, max=10.0)
+        
+        # FIX: Use Huber Loss (SmoothL1Loss) instead of MSE for stability
+        loss_sigma = F.smooth_l1_loss(pred_log_sigma_unclamped, target_log_sigma)
         
         return loss_mu, loss_sigma
+
     
     def _compute_loss_gaussian_nll(self, pred_mu, pred_sigma, mu_t, sigma_t):
         """
@@ -509,8 +519,33 @@ class Normalizer(NormalizerModel):
                 f"Unknown loss_type: {self.loss_type}. "
                 f"Supported types: 'mse', 'gaussian_nll'"
             )
+
         
         total_loss = loss_mu + loss_sigma
+
+
+        # Log prediction statistics to monitor if model is learning~
+        # if batch_idx % 500000 == 0:  # Log every 100 batches to avoid spam
+        #     with torch.no_grad():
+        #         # Debug: Check shapes and actual errors
+        #         print(f"\n[Batch {batch_idx}] Debug Loss Computation:")
+        #         print(f"  pred_mu shape: {pred_mu.shape}, mu_t shape: {mu_t.shape}")
+        #         print(f"  pred_mu mean: {pred_mu.mean().item():.4f}, mu_t mean: {mu_t.mean().item():.4f}")
+        #         print(f"  pred_mu range: [{pred_mu.min().item():.4f}, {pred_mu.max().item():.4f}]")
+        #         print(f"  mu_t range: [{mu_t.min().item():.4f}, {mu_t.max().item():.4f}]")
+        #         mu_errors = (pred_mu - mu_t).abs()
+        #         print(f"  mu errors: mean={mu_errors.mean().item():.4f}, max={mu_errors.max().item():.4f}, min={mu_errors.min().item():.4f}")
+        #         mu_squared_errors = (pred_mu - mu_t) ** 2
+        #         print(f"  mu squared errors: mean={mu_squared_errors.mean().item():.4f}, max={mu_squared_errors.max().item():.4f}")
+        #         print(f"  loss_mu (computed): {loss_mu.item():.4f}")
+        #         print(f"  loss_mu (manual mean): {mu_squared_errors.mean().item():.4f}")
+                
+        #         self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=False)
+        #         self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=False)
+        #         self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=False)
+        #         self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=False)
+        #         self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=False)
+        #         self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=False)
 
         if self.do_scale:
             if torch.isnan(pred_z_min).any() or torch.isnan(pred_z_max).any():
@@ -542,12 +577,34 @@ class Normalizer(NormalizerModel):
         # Log prediction statistics to monitor if model is learning
         if batch_idx % 100 == 0:  # Log every 100 batches to avoid spam
             with torch.no_grad():
-                self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=False)
-                self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=False)
-                self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=False)
-                self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=False)
-                self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=False)
-                self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=False)
+                # Log shapes (as number of elements for logging purposes)
+                self.log("pred_mu_num_elements", pred_mu.numel(), on_step=True, on_epoch=False)
+                self.log("mu_t_num_elements", mu_t.numel(), on_step=True, on_epoch=False)
+                self.log("pred_mu_batch_size", pred_mu.shape[0] if len(pred_mu.shape) > 0 else 1, on_step=True, on_epoch=False)
+                self.log("pred_mu_dims", pred_mu.shape[1] if len(pred_mu.shape) > 1 else 1, on_step=True, on_epoch=False)
+                
+                # Log ranges
+                self.log("pred_mu_min", pred_mu.min(), on_step=True, on_epoch=False)
+                self.log("pred_mu_max", pred_mu.max(), on_step=True, on_epoch=False)
+                self.log("mu_t_min", mu_t.min(), on_step=True, on_epoch=False)
+                self.log("mu_t_max", mu_t.max(), on_step=True, on_epoch=False)
+                
+                # Log error statistics
+                mu_errors = (pred_mu - mu_t).abs()
+                mu_squared_errors = (pred_mu - mu_t) ** 2
+                self.log("mu_error_mean", mu_errors.mean(), on_step=True, on_epoch=False)
+                self.log("mu_error_max", mu_errors.max(), on_step=True, on_epoch=False)
+                self.log("mu_error_min", mu_errors.min(), on_step=True, on_epoch=False)
+                self.log("mu_squared_error_mean", mu_squared_errors.mean(), on_step=True, on_epoch=False)
+                self.log("mu_squared_error_max", mu_squared_errors.max(), on_step=True, on_epoch=False)
+                
+                # Log existing statistics
+                self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=True)
+                self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=True)
+                self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=True)
+                self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=True)
+                self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=True)
+                self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=True)
         
         return total_loss
 
@@ -891,3 +948,166 @@ class Normalizer(NormalizerModel):
                     arr = z * (sigma[d] + 1e-8) + mu[d]
                     df_out.at[i, col] = arr
         return df_out
+
+    def _build_training_samples(
+        self,
+        mode: str = "sample",                 # "sample" or "group"
+        group_vars: Optional[list[str]] = None,
+        use_quantile_scale: bool = False,     # if True: use q01/q99 instead of min/max for zlow/zhigh
+        q_low: float = 0.01,
+        q_high: float = 0.99,
+    ) -> list:
+        """
+        Build training samples for the normalizer.
+
+        Returns a list of tuples:
+        (context_vars_dict, dynamic_ctx_dict, mu_array, std_array, zlow_array, zhigh_array)
+
+        - mode="sample": one tuple per row
+        - mode="group": one tuple per group (grouped by group_vars)
+
+        Notes:
+        - group mode is only well-defined for *static* variables. For dynamic context,
+            this function will raise unless you explicitly exclude them from grouping.
+        - continuous vars: if you keep them continuous (float), grouping by them is usually pointless.
+            In group mode, we therefore ignore continuous vars by default unless you explicitly put them in group_vars.
+        """
+        assert mode in {"sample", "group"}, f"mode must be 'sample' or 'group', got {mode}"
+
+        df = self.dataset.data.copy()
+
+        # Identify context types
+        continuous_vars = set(getattr(self.dataset_cfg, "continuous_context_vars", None) or [])
+        dynamic_vars = set(self.dynamic_context_vars)  # time_series context vars
+        static_vars = [v for v in self.static_context_vars]  # categorical + continuous
+
+        # Default grouping vars: static categorical only (exclude continuous + dynamic)
+        if group_vars is None:
+            group_vars = [v for v in static_vars if (v not in continuous_vars and v not in dynamic_vars)]
+
+        # Sanity: grouping by dynamic vars is almost always wrong (huge keys, high cardinality)
+        bad = [v for v in group_vars if v in dynamic_vars]
+        if bad:
+            raise ValueError(
+                f"group_vars contains dynamic(time_series) vars {bad}. "
+                f"Remove them or use mode='sample'."
+            )
+
+        # Helper: compute stats from a single row's time series columns
+        def _row_stats(row) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+            dim_points = []
+            for d, col_name in enumerate(self.time_series_cols):
+                arr = np.asarray(row[col_name], dtype=np.float32).reshape(-1)
+                dim_points.append(arr)
+
+            mu = np.array([x.mean() for x in dim_points], dtype=np.float32)
+            std = np.array([x.std() + 1e-8 for x in dim_points], dtype=np.float32)
+
+            if not self.do_scale:
+                return mu, std, None, None
+
+            zlow = np.zeros(self.time_series_dims, dtype=np.float32)
+            zhigh = np.zeros(self.time_series_dims, dtype=np.float32)
+
+            for i, (x, m, s) in enumerate(zip(dim_points, mu, std)):
+                z = (x - m) / s
+                if use_quantile_scale:
+                    zlow[i] = np.quantile(z, q_low).astype(np.float32)
+                    zhigh[i] = np.quantile(z, q_high).astype(np.float32)
+                else:
+                    zlow[i] = z.min().astype(np.float32)
+                    zhigh[i] = z.max().astype(np.float32)
+
+            return mu, std, zlow, zhigh
+
+        samples = []
+
+        if mode == "sample":
+            for _, row in df.iterrows():
+                context_vars_dict = {}
+
+                # static vars
+                for v in static_vars:
+                    if v not in row:
+                        continue
+                    if v in continuous_vars:
+                        context_vars_dict[v] = torch.tensor(row[v], dtype=torch.float32)
+                    else:
+                        context_vars_dict[v] = torch.tensor(row[v], dtype=torch.long)
+
+                # dynamic vars (store separately; TrainSet will tensorize them)
+                dynamic_ctx_dict = {}
+                for v in self.dynamic_context_vars:
+                    if v not in row:
+                        continue
+                    ts_data = row[v]
+                    if isinstance(ts_data, np.ndarray):
+                        dynamic_ctx_dict[v] = ts_data
+                    elif isinstance(ts_data, list):
+                        dynamic_ctx_dict[v] = np.array(ts_data)
+                    else:
+                        # scalar -> repeat
+                        L = self.num_ts_steps if self.num_ts_steps is not None else self.seq_len
+                        dynamic_ctx_dict[v] = np.full(L, ts_data)
+
+                mu, std, zlow, zhigh = _row_stats(row)
+
+                samples.append((context_vars_dict, dynamic_ctx_dict, mu, std, zlow, zhigh))
+
+            return samples
+
+        # mode == "group"
+        # Build grouped stats by aggregating all points from rows in each group.
+        # Context dict comes from group key values.
+        grouped = df.groupby(group_vars, dropna=False)
+
+        for group_key, gdf in grouped:
+            # group_key can be scalar or tuple depending on #group_vars
+            if len(group_vars) == 1:
+                group_key = (group_key,)
+
+            context_vars_dict = {}
+            for i, v in enumerate(group_vars):
+                # group vars should be categorical by default; cast to long.
+                # if user explicitly included a continuous var in group_vars, keep float.
+                if v in continuous_vars:
+                    context_vars_dict[v] = torch.tensor(group_key[i], dtype=torch.float32)
+                else:
+                    context_vars_dict[v] = torch.tensor(group_key[i], dtype=torch.long)
+
+            dynamic_ctx_dict = {}  # undefined for grouping; keep empty
+
+            # Aggregate raw points per dim
+            dim_points = [[] for _ in range(self.time_series_dims)]
+            for _, row in gdf.iterrows():
+                for d, col_name in enumerate(self.time_series_cols):
+                    arr = np.asarray(row[col_name], dtype=np.float32).reshape(-1)
+                    dim_points[d].append(arr)
+
+            dim_points = [np.concatenate(xs, axis=0) if len(xs) else np.zeros((0,), dtype=np.float32)
+                        for xs in dim_points]
+
+            mu = np.array([x.mean() if x.size else 0.0 for x in dim_points], dtype=np.float32)
+            std = np.array([x.std() + 1e-8 if x.size else 1.0 for x in dim_points], dtype=np.float32)
+
+            if self.do_scale:
+                zlow = np.zeros(self.time_series_dims, dtype=np.float32)
+                zhigh = np.zeros(self.time_series_dims, dtype=np.float32)
+                for i, (x, m, s) in enumerate(zip(dim_points, mu, std)):
+                    if x.size == 0:
+                        zlow[i], zhigh[i] = -2.0, 2.0
+                        continue
+                    z = (x - m) / s
+                    if use_quantile_scale:
+                        zlow[i] = np.quantile(z, q_low).astype(np.float32)
+                        zhigh[i] = np.quantile(z, q_high).astype(np.float32)
+                    else:
+                        zlow[i] = z.min().astype(np.float32)
+                        zhigh[i] = z.max().astype(np.float32)
+            else:
+                zlow = zhigh = None
+
+            samples.append((context_vars_dict, dynamic_ctx_dict, mu, std, zlow, zhigh))
+
+        return samples
+
