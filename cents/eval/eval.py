@@ -348,12 +348,12 @@ class Evaluator:
         """
         dataset.data = dataset.get_combined_rarity()
         real_data_subset = dataset.data.iloc[indices].reset_index(drop=True)
-        context_vars = {
-            name: torch.tensor(
-                real_data_subset[name].values, dtype=torch.long, device=self.device
-            )
-            for name in dataset.context_vars
-        }
+        continuous_vars = getattr(dataset, "continuous_vars", [])
+        context_vars = {}
+        for name in dataset.context_vars:
+            vals = real_data_subset[name].values
+            dtype = torch.float32 if name in continuous_vars else torch.long
+            context_vars[name] = torch.tensor(vals, dtype=dtype, device=self.device)
 
         generated_ts = model.generate(context_vars).cpu().numpy()
         if generated_ts.ndim == 2:

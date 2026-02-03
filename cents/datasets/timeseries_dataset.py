@@ -241,7 +241,6 @@ class TimeSeriesDataset(Dataset):
         Returns:
             DataLoader: Configured data loader.
         """
-        continuous_vars = getattr(self.cfg, "continuous_context_vars", None) or []
 
         self._normalize_continuous_vars()
         return DataLoader(
@@ -355,8 +354,6 @@ class TimeSeriesDataset(Dataset):
             time_series_cols=time_series_cols,
             categorical_time_series=self.categorical_time_series,
         )
-        print(mapping, "mapping")
-        print("ranges encode context vars")
         
         return encoded_data, mapping
 

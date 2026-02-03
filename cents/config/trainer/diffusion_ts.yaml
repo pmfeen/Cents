@@ -17,8 +17,8 @@ checkpoint:
 
 lr_scheduler_params:
   factor: 0.5
-  patience: 200
-  min_lr: 1.0e-5
+  patience: 50
+  min_lr: 1.0e-6
   threshold: 1.0e-1
   threshold_mode: rel
   verbose: false

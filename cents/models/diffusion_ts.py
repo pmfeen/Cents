@@ -10,6 +10,8 @@ from omegaconf import DictConfig
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm.auto import tqdm
+from contextlib import contextmanager
+
 
 from cents.models.base import GenerativeModel
 from cents.models.model_utils import (
@@ -30,6 +32,18 @@ class Diffusion_TS(GenerativeModel):
     Uses a Transformer backbone to predict and denoise time series over
     discrete diffusion timesteps. Supports EMA smoothing and configurable
     beta schedules.
+
+    Training objective (config model.training_objective): x0, epsilon, or v.
+      - x0: predict clean sample; loss = L1/L2(model_out, x_clean).
+      - epsilon: predict noise; loss = L1/L2(pred_epsilon, noise); pred_epsilon derived from model x0.
+      - v: v-parameterization; loss = L1/L2(pred_v, true_v); pred_v derived from model x0.
+    The network always outputs x0 (fc layer); sampling uses x0 and q_posterior unchanged.
+    Variance-debugging reference:
+      (a) Sampling: model predicts x0; reverse step uses q_posterior(x0,x_t,t);
+          noise term = sqrt(posterior_variance). Same beta schedule in train and sample.
+      (b) Normalization: per-group (context) z-score + optional [zmin,zmax] scale;
+          denorm must use the same normalizer.inverse_transform. Run
+          scripts/check_diffusion_consistency.py to verify norm/denorm identity.
     """
 
     def __init__(self, cfg: DictConfig):
@@ -96,6 +110,13 @@ class Diffusion_TS(GenerativeModel):
         )
         self.fast_sampling = self.sampling_timesteps < self.num_timesteps
         self.loss_type = cfg.model.loss_type
+        self.training_objective = getattr(
+            cfg.model, "training_objective", "x0"
+        ).lower()
+        if self.training_objective not in ("x0", "eps", "v"):
+            raise ValueError(
+                f"training_objective must be one of x0, eps, v; got {self.training_objective}"
+            )
 
         # register buffers for diffusion coefficients
         self.register_buffer("betas", betas)
@@ -127,7 +148,18 @@ class Diffusion_TS(GenerativeModel):
         self.register_buffer("posterior_mean_coef1", pmc1)
         self.register_buffer("posterior_mean_coef2", pmc2)
 
-        lw = torch.sqrt(alphas) * torch.sqrt(1.0 - alphas_cumprod) / betas / 100
+        # Loss weighting: default (legacy), uniform, snr, or min_snr (via compute_snr_weights)
+        loss_weighting = getattr(cfg.model, "loss_weighting", "default")
+        min_snr_gamma = getattr(cfg.model, "min_snr_gamma", 5.0)
+        if loss_weighting == "default":
+            lw = torch.sqrt(alphas) * torch.sqrt(1.0 - alphas_cumprod) / betas.clamp(min=1e-8) / 100
+        else:
+            lw = self.compute_snr_weights(
+                alphas_cumprod,
+                loss_weighting=loss_weighting,
+                objective=self.training_objective,
+                gamma=min_snr_gamma,
+            )
         self.register_buffer("loss_weight", lw)
 
         # choose reconstruction loss
@@ -246,6 +278,78 @@ class Diffusion_TS(GenerativeModel):
             - self.sqrt_recipm1_alphas_cumprod[t].view(-1, 1, 1) * noise
         )
 
+    def predict_start_from_v(
+        self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Reconstruct x0 from x_t and v-parameterization.
+        v = sqrt(alpha_bar_t) * epsilon - sqrt(1 - alpha_bar_t) * x0  =>  x0 = sqrt(alpha_bar_t) * x_t - sqrt(1 - alpha_bar_t) * v
+        """
+        return (
+            self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * x_t
+            - self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * v
+        )
+
+    def predict_noise_from_v(
+        self, x_t: torch.Tensor, t: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Reconstruct epsilon from x_t and v-parameterization.
+        v = sqrt(alpha_bar_t) * epsilon - sqrt(1 - alpha_bar_t) * x0  =>  epsilon = sqrt(1 - alpha_bar_t) * x_t + sqrt(alpha_bar_t) * v
+        """
+        return (
+            self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * x_t
+            + self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * v
+        )
+
+
+    def compute_snr_weights(
+        alphas_cumprod: torch.Tensor,
+        *,
+        loss_weighting: str,
+        objective: str,
+        gamma: float = 5.0,
+    ) -> torch.Tensor:
+        """
+        SNR-based loss weighting per timestep.
+
+        Args:
+            alphas_cumprod: Cumulative product of alphas, shape (n_steps,).
+            loss_weighting: "uniform" | "snr" | "min_snr".
+            objective: "eps" | "x0" | "v" — must match training objective.
+            gamma: Cap for SNR when loss_weighting == "min_snr".
+
+        Returns:
+            Weight tensor same shape as alphas_cumprod.
+        """
+        snr = alphas_cumprod / (1.0 - alphas_cumprod).clamp(min=1e-8)
+
+        if loss_weighting == "uniform":
+            return torch.ones_like(snr)
+
+        if loss_weighting == "snr":
+            if objective == "eps":
+                return 1.0 / (snr + 1.0)
+            elif objective == "x0":
+                return snr / (snr + 1.0)
+            elif objective == "v":
+                return 1.0 / torch.sqrt(snr + 1.0)
+            else:
+                raise ValueError(objective)
+
+        if loss_weighting == "min_snr":
+            snr_c = torch.minimum(snr, torch.full_like(snr, gamma))
+            if objective == "eps":
+                return snr_c / snr.clamp(min=1e-8)
+            elif objective == "x0":
+                return snr_c
+            elif objective == "v":
+                return snr_c / (snr + 1.0)
+            else:
+                raise ValueError(objective)
+
+        raise ValueError(loss_weighting)
+
     def q_posterior(
         self,
         x_start: torch.Tensor,
@@ -292,7 +396,8 @@ class Diffusion_TS(GenerativeModel):
                            f"NaN count: {torch.isnan(x).sum()}, Inf count: {torch.isinf(x).sum()}")
         
         b = x.shape[0]
-        t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
+        # t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
+        t = self.stratified_timesteps(b, self.num_timesteps, self.cfg.model.k_bins, device=self.device)
         embedding, cond_classification_logits = self._get_context_embedding(context_vars)
         # Check embedding for NaN/Inf
         if embedding.isnan().any() or embedding.isinf().any():
@@ -335,8 +440,27 @@ class Diffusion_TS(GenerativeModel):
         #         f"max={embedding.max():.4f}"
         #     )
         trend, season = self.model(c, t, padding_masks=None)
-        x_recon = self.fc(trend + season)
-        rec_loss = self.recon_loss_fn(x_recon, x)
+        x_start_pred = self.fc(trend + season)
+        # Compute loss based on training objective (network always predicts x0; we derive epsilon/v as needed)
+        if self.training_objective == "x0":
+            loss_per_elem = self.recon_loss_fn(x_start_pred, x, reduction="none")
+        elif self.training_objective == "epsilon":
+            pred_noise = self.predict_noise_from_start(x_noisy, t, x_start_pred)
+            loss_per_elem = self.recon_loss_fn(pred_noise, noise, reduction="none")
+        else:  # v
+            pred_noise = self.predict_noise_from_start(x_noisy, t, x_start_pred)
+            pred_v = (
+                self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * pred_noise
+                - self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * x_start_pred
+            )
+            true_v = (
+                self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * noise
+                - self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * x
+            )
+            loss_per_elem = self.recon_loss_fn(pred_v, true_v, reduction="none")
+        rec_loss = (
+            self.loss_weight[t].view(-1, 1, 1) * loss_per_elem
+        ).mean()
         return rec_loss, cond_classification_logits
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
@@ -371,7 +495,7 @@ class Diffusion_TS(GenerativeModel):
         #     #     print(outputs.mean(), labels.mean())
 
         
-        cond_loss /= len(cond_class_logits)
+        # cond_loss /= len(cond_class_logits)
 
         h, _ = self._get_context_embedding(cond_batch)
         tc_term = (
@@ -399,6 +523,7 @@ class Diffusion_TS(GenerativeModel):
                 "tc_loss": tc_term,
             },
             prog_bar=True,
+            sync_dist=True,
         )
         return total_loss
 
@@ -471,10 +596,10 @@ class Diffusion_TS(GenerativeModel):
                     pass
                     # print(f"  Missing context variables: {sorted(missing_vars)}")
                 # print(f"  No grad params (sample): {context_params_no_grad[:5]}...")
-            if context_params_with_grad:
-                avg_grad_norm = sum(g[1] for g in context_params_with_grad) / len(context_params_with_grad)
-                max_grad_norm = max(g[1] for g in context_params_with_grad)
-                print(f"[Debug] Context module gradients: avg_norm={avg_grad_norm:.6f}, max_norm={max_grad_norm:.6f}")
+            # if context_params_with_grad:
+            #     avg_grad_norm = sum(g[1] for g in context_params_with_grad) / len(context_params_with_grad)
+            #     max_grad_norm = max(g[1] for g in context_params_with_grad)
+            #     print(f"[Debug] Context module gradients: avg_norm={avg_grad_norm:.6f}, max_norm={max_grad_norm:.6f}")
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         """
@@ -609,6 +734,18 @@ class Diffusion_TS(GenerativeModel):
             x = x_start * alpha_next.sqrt() + c * pred_noise + sigma * noise
         return x
 
+    @contextmanager
+    def ema_scope(self):
+        if hasattr(self, "_ema") and self._ema and getattr(self.cfg.model, "use_ema_sampling", False):
+            self._ema.store(self.model.parameters())
+            self._ema.copy_to(self.model.parameters())
+            try:
+                yield
+            finally:
+                self._ema.restore(self.model.parameters())
+        else:
+            yield
+
     def generate(self, context_vars: dict) -> torch.Tensor:
         """
         Public entry to generate conditioned samples in batches.
@@ -623,48 +760,29 @@ class Diffusion_TS(GenerativeModel):
         total = len(next(iter(context_vars.values())))
         generated_samples = []
 
-        for start_idx in tqdm(
-            range(0, total, bs),
-            unit="seq",
-            desc="[CENTS] Generating samples",
-            leave=True,
-        ):
-            end_idx = min(start_idx + bs, total)
-            batch_context_vars = {
-                var_name: var_tensor[start_idx:end_idx]
-                for var_name, var_tensor in context_vars.items()
-            }
-            current_bs = end_idx - start_idx
-            shape = (current_bs, self.seq_len, self.time_series_dims)
+        with self.ema_scope():
+            for start_idx in tqdm(
+                range(0, total, bs),
+                unit="seq",
+                desc="[CENTS] Generating samples",
+                leave=True,
+            ):
+                end_idx = min(start_idx + bs, total)
+                batch_context_vars = {
+                    var_name: var_tensor[start_idx:end_idx]
+                    for var_name, var_tensor in context_vars.items()
+                }
+                current_bs = end_idx - start_idx
+                shape = (current_bs, self.seq_len, self.time_series_dims)
 
-            with torch.no_grad():
-                if getattr(self.cfg.model, "use_ema_sampling", False):
-                    self._ensure_ema_helper()
-                    if hasattr(self, "_ema") and self._ema:
-                        original_model = self.model
-                        self.model = self._ema.ema_model
-                        try:
-                            if self.fast_sampling:
-                                samples = self.fast_sample(shape, batch_context_vars)
-                            else:
-                                samples = self.sample(shape, batch_context_vars)
-                        finally:
-                            # Restore original model
-                            self.model = original_model
+                with torch.no_grad():
+                    if self.fast_sampling:
+                        samples = self.fast_sample(shape, batch_context_vars)
                     else:
-                        samples = (
-                            self.fast_sample(shape, batch_context_vars)
-                            if self.fast_sampling
-                            else self.sample(shape, batch_context_vars)
-                        )
-                else:
-                    samples = (
-                        self.fast_sample(shape, batch_context_vars)
-                        if self.fast_sampling
-                        else self.sample(shape, batch_context_vars)
-                    )
+                        samples = self.sample(shape, batch_context_vars)
 
-            generated_samples.append(samples)
+
+                generated_samples.append(samples.cpu())
 
         return torch.cat(generated_samples, dim=0)
         
@@ -679,41 +797,81 @@ class Diffusion_TS(GenerativeModel):
                 beta=self.cfg.model.ema_decay,
                 update_every=self.cfg.model.ema_update_interval,
             )
+    def stratified_timesteps(self, batch_size: int, num_timesteps: int, k_bins: int, device=None) -> torch.Tensor:
+        device = device or "cpu"
+        k_bins = min(k_bins, batch_size)
+        edges = torch.linspace(0, num_timesteps, steps=k_bins + 1, device=device)
+
+        # sample one t per bin
+        u = torch.rand(k_bins, device=device)
+        t_bins = (edges[:-1] + u * (edges[1:] - edges[:-1])).floor().clamp_(0, num_timesteps - 1).long()
+
+        # repeat to fill batch, then shuffle
+        reps = (batch_size + k_bins - 1) // k_bins
+        t = t_bins.repeat(reps)[:batch_size]
+        t = t[torch.randperm(batch_size, device=device)]
+        return t
+
 
 class EMA(nn.Module):
     """
     Exponential Moving Average (EMA) helper for model parameters.
-
-    Maintains a shadow copy of the model weights that are updated
-    via EMA every `update_every` steps.
     """
-
-    def __init__(self, model: nn.Module, beta: float, update_every: int):
-        """
-        Args:
-            model: Base model to copy for EMA tracking.
-            beta: EMA decay rate (0 < beta < 1).
-            update_every: Frequency (in steps) to apply EMA update.
-        """
+    def __init__(self, model: nn.Module, beta: float = 0.9999, update_every: int = 10):
         super().__init__()
-        self.model = copy.deepcopy(model)
-        self.ema_model = self.model.eval()
         self.beta = beta
         self.update_every = update_every
         self.step = 0
-        for param in self.ema_model.parameters():
-            param.requires_grad = False
+
+        # CRITICAL FIX 1: self.ema_model is the ONLY deepcopy. 
+        # It holds the shadow weights.
+        self.ema_model = copy.deepcopy(model)
+        self.ema_model.eval()
+        self.ema_model.requires_grad_(False)
+        
+        # CRITICAL FIX 2: We keep a reference to the LIVE model (not a copy)
+        # so we can grab the latest trained weights during update().
+        self.source_model = model 
+        
+        # Buffer to store temporary weights for the context manager
+        self.collected_params = []
 
     def update(self) -> None:
         """
-        Perform an EMA update of the shadow model parameters.
-        Called typically at end of each training batch.
+        Update the shadow parameters using the source model's current weights.
         """
         self.step += 1
         if self.step % self.update_every != 0:
             return
+        
         with torch.no_grad():
-            for ema_p, model_p in zip(
-                self.ema_model.parameters(), self.model.parameters()
-            ):
-                ema_p.data.mul_(self.beta).add_(model_p.data, alpha=1.0 - self.beta)
+            # Zip the shadow model (ema) against the live model (source)
+            for ema_p, src_p in zip(self.ema_model.parameters(), self.source_model.parameters()):
+                # ema_new = beta * ema_old + (1 - beta) * current_weight
+                ema_p.data.mul_(self.beta).add_(src_p.data, alpha=1.0 - self.beta)
+
+    def store(self, parameters):
+        """
+        Save the current parameters (of the live model) to a temporary list.
+        Used by the context manager to back up weights before swapping.
+        """
+        self.collected_params = [param.clone().cpu() for param in parameters]
+
+    def restore(self, parameters):
+        """
+        Restore the saved parameters back to the live model.
+        """
+        if not self.collected_params:
+            raise RuntimeError("No parameters stored to restore.")
+            
+        for param, saved_param in zip(parameters, self.collected_params):
+            param.data.copy_(saved_param.data.to(param.device))
+            
+        self.collected_params = [] # Clear memory
+
+    def copy_to(self, parameters):
+        """
+        Copy the EMA shadow weights INTO the live model parameters.
+        """
+        for param, ema_param in zip(parameters, self.ema_model.parameters()):
+            param.data.copy_(ema_param.data.to(param.device))

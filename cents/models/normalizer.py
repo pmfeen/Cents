@@ -523,30 +523,6 @@ class Normalizer(NormalizerModel):
         
         total_loss = loss_mu + loss_sigma
 
-
-        # Log prediction statistics to monitor if model is learning~
-        # if batch_idx % 500000 == 0:  # Log every 100 batches to avoid spam
-        #     with torch.no_grad():
-        #         # Debug: Check shapes and actual errors
-        #         print(f"\n[Batch {batch_idx}] Debug Loss Computation:")
-        #         print(f"  pred_mu shape: {pred_mu.shape}, mu_t shape: {mu_t.shape}")
-        #         print(f"  pred_mu mean: {pred_mu.mean().item():.4f}, mu_t mean: {mu_t.mean().item():.4f}")
-        #         print(f"  pred_mu range: [{pred_mu.min().item():.4f}, {pred_mu.max().item():.4f}]")
-        #         print(f"  mu_t range: [{mu_t.min().item():.4f}, {mu_t.max().item():.4f}]")
-        #         mu_errors = (pred_mu - mu_t).abs()
-        #         print(f"  mu errors: mean={mu_errors.mean().item():.4f}, max={mu_errors.max().item():.4f}, min={mu_errors.min().item():.4f}")
-        #         mu_squared_errors = (pred_mu - mu_t) ** 2
-        #         print(f"  mu squared errors: mean={mu_squared_errors.mean().item():.4f}, max={mu_squared_errors.max().item():.4f}")
-        #         print(f"  loss_mu (computed): {loss_mu.item():.4f}")
-        #         print(f"  loss_mu (manual mean): {mu_squared_errors.mean().item():.4f}")
-                
-        #         self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=False)
-        #         self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=False)
-        #         self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=False)
-        #         self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=False)
-        #         self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=False)
-        #         self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=False)
-
         if self.do_scale:
             if torch.isnan(pred_z_min).any() or torch.isnan(pred_z_max).any():
                 raise ValueError(
@@ -567,44 +543,44 @@ class Normalizer(NormalizerModel):
             )
         
         # Log individual components to understand what's happening
-        self.log("train_loss", total_loss, prog_bar=True)
-        self.log("loss_mu", loss_mu, on_step=True, on_epoch=True, prog_bar=False)
-        self.log("loss_sigma", loss_sigma, on_step=True, on_epoch=True, prog_bar=False)
+        self.log("train_loss", total_loss, prog_bar=True, sync_dist=True)
+        self.log("loss_mu", loss_mu, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        self.log("loss_sigma", loss_sigma, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         if self.do_scale:
-            self.log("loss_zmin", loss_zmin, on_step=True, on_epoch=True, prog_bar=False)
-            self.log("loss_zmax", loss_zmax, on_step=True, on_epoch=True, prog_bar=False)
+            self.log("loss_zmin", loss_zmin, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+            self.log("loss_zmax", loss_zmax, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         
         # Log prediction statistics to monitor if model is learning
         if batch_idx % 100 == 0:  # Log every 100 batches to avoid spam
             with torch.no_grad():
                 # Log shapes (as number of elements for logging purposes)
-                self.log("pred_mu_num_elements", pred_mu.numel(), on_step=True, on_epoch=False)
-                self.log("mu_t_num_elements", mu_t.numel(), on_step=True, on_epoch=False)
+                self.log("pred_mu_num_elements", pred_mu.numel(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("mu_t_num_elements", mu_t.numel(), on_step=True, on_epoch=False, sync_dist=True)
                 self.log("pred_mu_batch_size", pred_mu.shape[0] if len(pred_mu.shape) > 0 else 1, on_step=True, on_epoch=False)
-                self.log("pred_mu_dims", pred_mu.shape[1] if len(pred_mu.shape) > 1 else 1, on_step=True, on_epoch=False)
+                self.log("pred_mu_dims", pred_mu.shape[1] if len(pred_mu.shape) > 1 else 1, on_step=True, on_epoch=False, sync_dist=True)
                 
                 # Log ranges
-                self.log("pred_mu_min", pred_mu.min(), on_step=True, on_epoch=False)
-                self.log("pred_mu_max", pred_mu.max(), on_step=True, on_epoch=False)
-                self.log("mu_t_min", mu_t.min(), on_step=True, on_epoch=False)
-                self.log("mu_t_max", mu_t.max(), on_step=True, on_epoch=False)
+                self.log("pred_mu_min", pred_mu.min(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("pred_mu_max", pred_mu.max(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("mu_t_min", mu_t.min(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("mu_t_max", mu_t.max(), on_step=True, on_epoch=False, sync_dist=True)
                 
                 # Log error statistics
                 mu_errors = (pred_mu - mu_t).abs()
                 mu_squared_errors = (pred_mu - mu_t) ** 2
-                self.log("mu_error_mean", mu_errors.mean(), on_step=True, on_epoch=False)
-                self.log("mu_error_max", mu_errors.max(), on_step=True, on_epoch=False)
-                self.log("mu_error_min", mu_errors.min(), on_step=True, on_epoch=False)
-                self.log("mu_squared_error_mean", mu_squared_errors.mean(), on_step=True, on_epoch=False)
-                self.log("mu_squared_error_max", mu_squared_errors.max(), on_step=True, on_epoch=False)
+                self.log("mu_error_mean", mu_errors.mean(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("mu_error_max", mu_errors.max(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("mu_error_min", mu_errors.min(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("mu_squared_error_mean", mu_squared_errors.mean(), on_step=True, on_epoch=False, sync_dist=True)
+                self.log("mu_squared_error_max", mu_squared_errors.max(), on_step=True, on_epoch=False, sync_dist=True)
                 
                 # Log existing statistics
-                self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=True)
-                self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=True)
-                self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=True)
-                self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=True)
-                self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=True)
-                self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=True)
+                self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=True, sync_dist=True)
+                self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=True, sync_dist=True)
+                self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=True, sync_dist=True)
+                self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=True, sync_dist=True)
+                self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=True, sync_dist=True)
+                self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=True, sync_dist=True)
         
         return total_loss
 

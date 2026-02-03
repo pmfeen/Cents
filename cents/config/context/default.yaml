@@ -3,7 +3,7 @@
 
 # Static context: used by generative models (ACGAN, Diffusion_TS) for conditioning
 static_context:
-  type: sep_mlp  # Context module type (e.g., "mlp", "sep_mlp")
+  type: mlp  # Context module type (e.g., "mlp", "sep_mlp")
   # Future parameters can be added here:
   # n_layers: 2
   # hidden_dim: 256
