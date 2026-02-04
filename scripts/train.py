@@ -1,52 +1,84 @@
 from datetime import datetime
-import pandas as pd
+import yaml
+from pathlib import Path
 
 from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
 from cents.datasets.airquality import AirQualityDataset
 from cents.datasets.vehicle import VehicleDataset
 from cents.trainer import Trainer
-from cents.utils.utils import set_context_config_path, set_context_overrides
-from pytorch_lightning.callbacks import EarlyStopping
+from cents.utils.utils import set_context_config_path, set_context_overrides, get_context_config
+from omegaconf import OmegaConf
 import warnings
 import argparse
+
 warnings.simplefilter(action='ignore', category=FutureWarning)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RUNS_DIR = PROJECT_ROOT / "runs"
+
+
+def _write_run_summary(run_dir: Path, run_name: str, trainer: Trainer) -> None:
+    """Write a summary YAML of run choices (context, model, dataset, trainer) to run_dir."""
+    cfg = trainer.cfg
+    context_cfg = get_context_config()
+    summary = {
+        "run_name": run_name,
+        "run_dir": str(run_dir),
+        "dataset": OmegaConf.to_container(cfg.dataset, resolve=True) if hasattr(cfg, "dataset") and cfg.dataset else {},
+        "model": OmegaConf.to_container(cfg.model, resolve=True) if hasattr(cfg, "model") and cfg.model else {},
+        "context": OmegaConf.to_container(context_cfg, resolve=True) if context_cfg else {},
+        "trainer": OmegaConf.to_container(cfg.trainer, resolve=True) if hasattr(cfg, "trainer") and cfg.trainer else {},
+    }
+    path = run_dir / "summary.yaml"
+    with open(path, "w") as f:
+        yaml.dump(summary, f, default_flow_style=False, sort_keys=False)
+    print(f"[Cents] Wrote run summary to {path}")
 
 
 def main(args) -> None:
     MODEL_NAME = args.model_name
     CR_LOSS_WEIGHT = args.cr_loss_weight
     TC_LOSS_WEIGHT = args.tc_loss_weight
-    
+    run_name = args.run_name
+
+    # Create run directory under runs/
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = RUNS_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Cents] Run directory: {run_dir}")
+
     # Set custom context config path if provided
     if args.context_config_path:
         set_context_config_path(args.context_config_path)
-    
+
     # Set context config overrides if provided
     if args.context_overrides:
         set_context_overrides(args.context_overrides)
-    
-    # Skip heavy processing for DDP compatibility
 
     if args.dataset == "pecanstreet":
         dataset = PecanStreetDataset(
             overrides=[f"skip_heavy_processing={args.skip_heavy_processing}, time_series_dims=1, user_group=all"],
-            force_retrain_normalizer=args.force_retrain_normalizer
+            force_retrain_normalizer=args.force_retrain_normalizer,
+            run_dir=str(run_dir),
         )
     elif args.dataset == "commercial":
         dataset = CommercialDataset(
             overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
-            force_retrain_normalizer=args.force_retrain_normalizer
+            force_retrain_normalizer=args.force_retrain_normalizer,
+            run_dir=str(run_dir),
         )
     elif args.dataset == "airquality":
         dataset = AirQualityDataset(
             overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
-            force_retrain_normalizer=args.force_retrain_normalizer
+            force_retrain_normalizer=args.force_retrain_normalizer,
+            run_dir=str(run_dir),
         )
     elif args.dataset == "vehicle":
         dataset = VehicleDataset(
             overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
-            force_retrain_normalizer=args.force_retrain_normalizer
+            force_retrain_normalizer=args.force_retrain_normalizer,
+            run_dir=str(run_dir),
         )
     else:
         raise ValueError(f"Dataset {args.dataset} not supported")
@@ -54,16 +86,17 @@ def main(args) -> None:
     print("Initialized Dataset")
 
     trainer_overrides = [
+        f"run_dir={run_dir}",
         f"trainer.max_epochs={args.epochs}",
         f"trainer.strategy={args.ddp_strategy}",
         f"trainer.devices={args.devices}",
         f"trainer.eval_after_training={args.eval_after_training}",
         f"train.accelerator={args.accelerator}",
-        "trainer.early_stopping.patience=100",  # Stop if no improvement for 100 epochs
-        "trainer.early_stopping.monitor=train_loss",  # Monitor training loss
-        "trainer.early_stopping.mode=min",  # Stop when loss stops decreasing
-        f"trainer.enable_checkpointing={args.enable_checkpointing}",  # Explicitly enable checkpointing
-        "trainer.logger=False",  # Disable logger to see checkpoint messages
+        "trainer.early_stopping.patience=100",
+        "trainer.early_stopping.monitor=train_loss",
+        "trainer.early_stopping.mode=min",
+        f"trainer.enable_checkpointing={args.enable_checkpointing}",
+        "trainer.logger=False",
         f"wandb.enabled={args.wandb_enabled}",
         f"wandb.project={args.wandb_project}",
         f"wandb.entity={args.wandb_entity}",
@@ -77,6 +110,8 @@ def main(args) -> None:
         dataset=dataset,
         overrides=trainer_overrides,
     )
+
+    _write_run_summary(run_dir, run_name, trainer)
 
     trainer.fit(ckpt_path=args.resume_from_checkpoint)
 
@@ -108,7 +143,10 @@ if __name__ == "__main__":
     parser.add_argument("--force-retrain-normalizer", action="store_true",
                         help="Force retraining of normalizer even if cached version exists")
     parser.add_argument("--resume-from-checkpoint", type=str, default=None,
-        help="Path to checkpoint file (.ckpt) to resume training from", 
+        help="Path to checkpoint file (.ckpt) to resume training from",
+    )
+    parser.add_argument("--run-name", type=str, required=True,
+        help="Name of this run. A directory runs/<run-name> will be created for checkpoints, cache, and summary.",
     )
 
     args = parser.parse_args()

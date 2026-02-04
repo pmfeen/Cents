@@ -56,6 +56,7 @@ class TimeSeriesDataset(Dataset):
         size: int = None,
         categorical_time_series: Dict[str, int] = None,
         force_retrain_normalizer: bool = False,
+        run_dir: Any = None,
     ):
         # Initialize basic attributes
         # Handle OmegaConf ListConfig objects
@@ -98,7 +99,8 @@ class TimeSeriesDataset(Dataset):
         self.normalize = normalize
         self.scale = scale
         self.force_retrain_normalizer = force_retrain_normalizer
-        
+        self.run_dir = Path(run_dir) if run_dir is not None else None
+
         # Store categorical time series info
         self.categorical_time_series = categorical_time_series or {}
 
@@ -571,11 +573,14 @@ class TimeSeriesDataset(Dataset):
     def _get_rarity_cache_path(self) -> str:
         """Get cache file path for rarity features."""
         import hashlib
-        # Create a hash based on dataset characteristics for cache key
         context_cfg = get_context_config()
         context_module_type = context_cfg.static_context.type
         cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{str(sorted(self.context_vars))}_{context_module_type or ''}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+        if self.run_dir is not None:
+            cache_dir = self.run_dir / "cache" / "rarity"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return str(cache_dir / f"rarity_{cache_hash}.pkl")
         cache_dir = os.path.join(ROOT_DIR, "cache", "rarity")
         os.makedirs(cache_dir, exist_ok=True)
         return os.path.join(cache_dir, f"rarity_{cache_hash}.pkl")
@@ -584,12 +589,15 @@ class TimeSeriesDataset(Dataset):
         """Get cache file path for normalized data."""
         import hashlib
         from pathlib import Path
-        # Create hash based on dataset + normalizer characteristics
         context_cfg = get_context_config()
         context_module_type = context_cfg.dynamic_context.type
         stats_head_type = context_cfg.normalizer.stats_head_type
         cache_key = f"{self.name}_{len(self.data)}_{self.seq_len}_{self.normalize}_{self.scale}_{context_module_type or ''}_{stats_head_type or ''}"
         cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:8]
+        if self.run_dir is not None:
+            cache_dir = self.run_dir / "cache" / "normalized_data"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return cache_dir / f"normalized_{cache_hash}.pkl"
         cache_dir = Path(ROOT_DIR) / "cache" / "normalized_data"
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir / f"normalized_{cache_hash}.pkl"
@@ -642,9 +650,12 @@ class TimeSeriesDataset(Dataset):
         On first run, trains a new Normalizer and writes a single state dict to cache.
         On subsequent runs, loads that file. If loading fails, deletes the corrupted cache and retrains.
         """
-        normalizer_dir = (
-            Path.home() / ".cache" / "cents" / "checkpoints" / self.name / "normalizer"
-        )
+        if self.run_dir is not None:
+            normalizer_dir = self.run_dir / "normalizer"
+        else:
+            normalizer_dir = (
+                Path.home() / ".cache" / "cents" / "checkpoints" / self.name / "normalizer"
+            )
         normalizer_dir.mkdir(parents=True, exist_ok=True)
         
         # Get context_module_type and stats_head_type from context config

@@ -15,9 +15,10 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 class CommercialDataset(TimeSeriesDataset):
-    def __init__(self, cfg: DictConfig = None, 
+    def __init__(self, cfg: DictConfig = None,
                  overrides: Optional[List[str]] = None,
-                 force_retrain_normalizer: bool = False):
+                 force_retrain_normalizer: bool = False,
+                 run_dir: Optional[str] = None):
         
         """
         Initializes the commercial energy dataset.
@@ -56,6 +57,7 @@ class CommercialDataset(TimeSeriesDataset):
             skip_heavy_processing=cfg.get('skip_heavy_processing', False),
             size=cfg.get('max_samples', None),
             force_retrain_normalizer=force_retrain_normalizer,
+            run_dir=run_dir,
         )
 
     def _load_data(self):

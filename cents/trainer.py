@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -174,6 +175,8 @@ class Trainer:
         if not hasattr(cfg, "run_dir") or not cfg.run_dir:
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             cfg.run_dir = str(PKG_ROOT / "outputs" / cfg.job_name / timestamp)
+        # Checkpoint dir: run_dir/checkpoints so run root stays clean
+        cfg.checkpoint_dir = str(Path(cfg.run_dir) / "checkpoints")
         return cfg
 
     def _instantiate_model(self):
@@ -223,15 +226,19 @@ class Trainer:
             filename_parts.append(f"stats{stats_head_type}")
         
 
+        checkpoint_dir = getattr(self.cfg, "checkpoint_dir", None) or str(Path(self.cfg.run_dir) / "checkpoints")
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
         callbacks.append(
             ModelCheckpoint(
-                dirpath=self.cfg.run_dir,
+                dirpath=checkpoint_dir,
                 filename="_".join(filename_parts),
                 save_last=tc.checkpoint.save_last,
                 save_on_train_epoch_end=True, ### Perhaps excessive
             )
         )
         callbacks.append(EvalAfterTraining(self.cfg, self.dataset))
+        if getattr(self.cfg, "run_dir", None):
+            callbacks.append(LogLossToCsv(self.cfg.run_dir))
         logger = False
         if getattr(self.cfg, "wandb", None) and self.cfg.wandb.enabled:
             logger = WandbLogger(
@@ -253,6 +260,41 @@ class Trainer:
             logger=logger,
             default_root_dir=self.cfg.run_dir,
         )
+
+
+class LogLossToCsv(Callback):
+    """Append epoch loss values to runs/<run_name>/train_losses.csv."""
+
+    def __init__(self, run_dir: str):
+        super().__init__()
+        self.run_dir = Path(run_dir)
+        self._csv_path = self.run_dir / "train_losses.csv"
+        self._header_written = False
+
+    def _ensure_header(self, metric_names: List[str]) -> None:
+        if self._header_written:
+            return
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch"] + metric_names)
+        self._header_written = True
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        metrics = trainer.callback_metrics
+        if not metrics:
+            return
+        # Filter to loss-like keys and sort for consistent column order
+        loss_keys = sorted(k for k in metrics if "loss" in k.lower())
+        if not loss_keys:
+            return
+        self._ensure_header(loss_keys)
+        row = [trainer.current_epoch]
+        for k in loss_keys:
+            v = metrics[k]
+            row.append(float(v) if hasattr(v, "item") else float(v))
+        with open(self._csv_path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
 
 
 class EvalAfterTraining(Callback):

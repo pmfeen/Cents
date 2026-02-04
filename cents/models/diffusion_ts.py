@@ -304,6 +304,7 @@ class Diffusion_TS(GenerativeModel):
 
 
     def compute_snr_weights(
+        self,
         alphas_cumprod: torch.Tensor,
         *,
         loss_weighting: str,
@@ -524,6 +525,7 @@ class Diffusion_TS(GenerativeModel):
             },
             prog_bar=True,
             sync_dist=True,
+            on_epoch=True,
         )
         return total_loss
 
