@@ -88,7 +88,7 @@ class Trainer:
             train_loader = self.dataset.get_train_dataloader(
                 batch_size=self.cfg.trainer.batch_size,
                 shuffle=True,
-                num_workers=6,  # Maximum for 7.5GB/10GB GPU usage
+                num_workers=4,  # Maximum for 7.5GB/10GB GPU usage
                 persistent_workers=True,
             )
             print(f"[Cents] Training model on {len(train_loader)} batches")

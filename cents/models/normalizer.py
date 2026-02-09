@@ -644,7 +644,7 @@ class Normalizer(NormalizerModel):
             batch_size=self.normalizer_training_cfg.batch_size,
             shuffle=True,
             num_workers=4,  # Use fewer workers to reduce overhead
-            persistent_workers=False,  # Disable to avoid multiprocessing cleanup issues
+            persistent_workers=True,  # Disable to avoid multiprocessing cleanup issues
             pin_memory=torch.cuda.is_available(),  # Helps with GPU transfer
             prefetch_factor=2,  # Reduce prefetch to avoid memory issues
         )

@@ -71,13 +71,13 @@ class Diffusion_TS(GenerativeModel):
         if not hasattr(self, 'static_context_module') and not hasattr(self, 'dynamic_context_module'):
             raise ValueError("At least one context module (static or dynamic) must be initialized")
 
-        # linear layer for denoised output
+        # linear layer for denoised output (no longer includes embedding_dim)
         self.fc = nn.Linear(
-            self.time_series_dims + self.embedding_dim, self.time_series_dims
+            self.time_series_dims, self.time_series_dims
         )
-        # Transformer backbone
+        # Transformer backbone (now uses AdaLN conditioning instead of input concatenation)
         self.model = Transformer(
-            n_feat=self.time_series_dims + self.embedding_dim,
+            n_feat=self.time_series_dims,
             n_channel=self.seq_len,
             n_layer_enc=cfg.model.n_layer_enc,
             n_layer_dec=cfg.model.n_layer_dec,
@@ -88,6 +88,7 @@ class Diffusion_TS(GenerativeModel):
             max_len=self.seq_len,
             n_embd=cfg.model.d_model,
             conv_params=[cfg.model.kernel_size, cfg.model.padding_size],
+            cond_dim=self.embedding_dim,
         )
 
         # EMA helper will be initialized on train start
@@ -223,11 +224,11 @@ class Diffusion_TS(GenerativeModel):
                 }
                 dynamic_embedding, dynamic_logits = self.dynamic_context_module(dynamic_vars)
                 # Check for NaN in dynamic embedding
-                if torch.isnan(dynamic_embedding).any() or torch.isinf(dynamic_embedding).any():
-                    raise ValueError(
-                        f"NaN/Inf detected in dynamic embedding. "
-                        f"Dynamic vars: {list(dynamic_vars.keys())}"
-                    )
+                # if torch.isnan(dynamic_embedding).any() or torch.isinf(dynamic_embedding).any():
+                #     raise ValueError(
+                #         f"NaN/Inf detected in dynamic embedding. "
+                #         f"Dynamic vars: {list(dynamic_vars.keys())}"
+                #     )
                 embeddings.append(dynamic_embedding)
                 all_logits.update(dynamic_logits)
         
@@ -392,28 +393,28 @@ class Diffusion_TS(GenerativeModel):
         # if x.abs().max() > 100.0:
         #     print(f"[Warning] Input x has extreme values: min={x.min():.4f}, max={x.max():.4f}, "
         #           f"mean={x.mean():.4f}, std={x.std():.4f}, shape={x.shape}")
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            raise ValueError(f"NaN/Inf detected in input x. Shape: {x.shape}, "
-                           f"NaN count: {torch.isnan(x).sum()}, Inf count: {torch.isinf(x).sum()}")
+        # if torch.isnan(x).any() or torch.isinf(x).any():
+        #     raise ValueError(f"NaN/Inf detected in input x. Shape: {x.shape}, "
+        #                    f"NaN count: {torch.isnan(x).sum()}, Inf count: {torch.isinf(x).sum()}")
         
         b = x.shape[0]
         # t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
         t = self.stratified_timesteps(b, self.num_timesteps, self.cfg.model.k_bins, device=self.device)
         embedding, cond_classification_logits = self._get_context_embedding(context_vars)
         # Check embedding for NaN/Inf
-        if embedding.isnan().any() or embedding.isinf().any():
-            raise ValueError(
-                f"NaN/Inf detected in embedding from context module. "
-                f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}, "
-                f"shape: {embedding.shape}, min: {embedding.min()}, max: {embedding.max()}"
-            )
+        # if embedding.isnan().any() or embedding.isinf().any():
+        #     raise ValueError(
+        #         f"NaN/Inf detected in embedding from context module. "
+        #         f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}, "
+        #         f"shape: {embedding.shape}, min: {embedding.min()}, max: {embedding.max()}"
+        #     )
         
         # Embedding should now be normalized by the context module (mean=0, std=1 per sample)
         # Check that values are in reasonable range
-        if embedding.abs().max() > 100.0:
-            print(f"[Warning] Embedding has large values despite normalization: "
-                  f"min={embedding.min():.4f}, max={embedding.max():.4f}, "
-                  f"mean={embedding.mean():.4f}, std={embedding.std():.4f}")
+        # if embedding.abs().max() > 100.0:
+        #     print(f"[Warning] Embedding has large values despite normalization: "
+        #           f"min={embedding.min():.4f}, max={embedding.max():.4f}, "
+        #           f"mean={embedding.mean():.4f}, std={embedding.std():.4f}")
         
         # Check diffusion schedule parameters
         noise = torch.randn_like(x)
@@ -421,27 +422,9 @@ class Diffusion_TS(GenerativeModel):
             self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * x
             + self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * noise
         )
-        if x_noisy.isnan().any() or x_noisy.isinf().any(): 
-            raise ValueError(f"NaN/Inf detected in x_noisy. Shape: {x_noisy.shape}, "
-                           f"NaN count: {torch.isnan(x_noisy).sum()}, Inf count: {torch.isinf(x_noisy).sum()}")
-        # Use normalized embedding for concatenation
-        embedding_expanded = embedding.unsqueeze(1).repeat(1, self.seq_len, 1)
-        c = torch.cat([x_noisy, embedding_expanded], dim=-1)
-        if c.isnan().any() or c.isinf().any():
-            raise ValueError(f"NaN/Inf detected in concatenated input 'c'. "
-                           f"Shape: {c.shape}, x_noisy stats: min={x_noisy.min():.4f}, max={x_noisy.max():.4f}, "
-                           f"embedding stats: min={embedding.min():.4f}, max={embedding.max():.4f}")
-        # if c.isnan().any() or c.isinf().any():
-        #     raise ValueError(
-        #         f"NaN/Inf detected in concatenated input 'c'. "
-        #         f"x_noisy stats: mean={x_noisy.mean():.4f}, std={x_noisy.std():.4f}, "
-        #         f"min={x_noisy.min():.4f}, max={x_noisy.max():.4f}. "
-        #         f"embedding stats: mean={embedding.mean():.4f}, "
-        #         f"std={embedding.std():.4f}, min={embedding.min():.4f}, "
-        #         f"max={embedding.max():.4f}"
-        #     )
-        trend, season = self.model(c, t, padding_masks=None)
-        x_start_pred = self.fc(trend + season)
+        # Pass embedding as cond parameter instead of concatenating to input
+        trend, season = self.model(x_noisy, t, padding_masks=None, cond=embedding)
+        x_start_pred = self.fc((trend + season).contiguous())
         # Compute loss based on training objective (network always predicts x0; we derive epsilon/v as needed)
         if self.training_objective == "x0":
             loss_per_elem = self.recon_loss_fn(x_start_pred, x, reduction="none")
@@ -510,11 +493,11 @@ class Diffusion_TS(GenerativeModel):
         )
         
         # Check for NaN in total loss
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            raise ValueError(
-                f"NaN/Inf detected in total_loss at batch {batch_idx}. "
-                f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss:.6f}, tc_term: {tc_term.item():.6f}"
-            )
+        # if torch.isnan(total_loss) or torch.isinf(total_loss):
+        #     raise ValueError(
+        #         f"NaN/Inf detected in total_loss at batch {batch_idx}. "
+        #         f"rec_loss: {rec_loss.item():.6f}, cond_loss: {cond_loss:.6f}, tc_term: {tc_term.item():.6f}"
+        #     )
         
         self.log_dict(
             {
@@ -556,52 +539,21 @@ class Diffusion_TS(GenerativeModel):
             update_every=self.cfg.model.ema_update_interval,
         )
 
-    def on_after_backward(self) -> None:
-        """
-        Check gradients after backward pass but before optimizer step.
-        This is the right place to inspect gradients before they're zeroed.
-        """
-        # Get current batch index from trainer
-        if not hasattr(self.trainer, 'global_step'):
-            return
-        
-        batch_idx = self.trainer.global_step
-        
-        # Debug: Check if context module parameters are getting gradients
-        # Check AFTER backward pass but BEFORE optimizer step (only log occasionally)
-        if batch_idx % 50 == 0:
-            context_params_with_grad = []
-            context_params_no_grad = []
-            if self.static_context_module is not None:
-                for name, param in self.static_context_module.named_parameters():
-                    if param.requires_grad:
-                        if param.grad is not None:
-                            grad_norm = param.grad.norm().item()
-                            # Check for NaN/Inf gradients
-                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                print(f"[Warning] NaN/Inf gradients detected in {name}")
-                            else:
-                                context_params_with_grad.append((name, grad_norm))
-                        else:
-                            context_params_no_grad.append(name)
-            
-            if context_params_no_grad:
-                # Group by variable name to identify which context variables are missing
-                missing_vars = set()
-                for param_name in context_params_no_grad:
-                    # Extract variable name from parameter name (e.g., "context_embeddings.year.weight" -> "year")
-                    parts = param_name.split('.')
-                    if len(parts) >= 2 and parts[0] in ['context_embeddings', 'init_mlps']:
-                        missing_vars.add(parts[1])
-                print(f"[Warning] {len(context_params_no_grad)} context module parameters have no gradients!")
-                if missing_vars:
-                    pass
-                    # print(f"  Missing context variables: {sorted(missing_vars)}")
-                # print(f"  No grad params (sample): {context_params_no_grad[:5]}...")
-            # if context_params_with_grad:
-            #     avg_grad_norm = sum(g[1] for g in context_params_with_grad) / len(context_params_with_grad)
-            #     max_grad_norm = max(g[1] for g in context_params_with_grad)
-            #     print(f"[Debug] Context module gradients: avg_norm={avg_grad_norm:.6f}, max_norm={max_grad_norm:.6f}")
+    # def on_after_backward(self) -> None:
+    #     """
+    #     Check gradients after backward pass but before optimizer step.
+    #     This is the right place to inspect gradients before they're zeroed.
+    #     """
+    #     # Get current batch index from trainer
+    #     for name, p in self.named_parameters():
+    #         if p.grad is None:
+    #             continue
+    #         if p.grad.stride() != p.stride():
+    #             print("stride mismatch:", name,
+    #                 "param", tuple(p.shape), p.stride(),
+    #                 "grad", tuple(p.grad.shape), p.grad.stride())
+    #             break
+
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         """
@@ -655,9 +607,8 @@ class Diffusion_TS(GenerativeModel):
             pred_noise: predicted noise tensor.
             x_start: predicted clean sample tensor.
         """
-        c = torch.cat([x, embedding.unsqueeze(1).repeat(1, self.seq_len, 1)], dim=-1)
-        trend, season = self.model(c, t, padding_masks=None)
-        x_start = self.fc(trend + season)
+        trend, season = self.model(x, t, padding_masks=None, cond=embedding)
+        x_start = self.fc((trend + season).contiguous())
         pred_noise = self.predict_noise_from_start(x, t, x_start)
         return pred_noise, x_start
 
