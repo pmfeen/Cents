@@ -220,6 +220,8 @@ class DataGenerator:
         ckpt_path, state = self._resolve_ckpt(model_ckpt)
         ModelCls = get_model_cls(self.model_type)
 
+        print(self.cfg)
+
         if ckpt_path.suffix == ".ckpt":
             print(f"[Cents] Loading model from checkpoint: {ckpt_path}")
             self.model = (

@@ -562,39 +562,39 @@ class Diffusion_TS(GenerativeModel):
         if hasattr(self, '_ema') and self._ema:
             self._ema.update()
 
-    def on_load_checkpoint(self, checkpoint: dict) -> None:
-        """
-        Restore EMA weights from checkpoint after loading.
-        """
-        super().on_load_checkpoint(checkpoint)
+    # def on_load_checkpoint(self, checkpoint: dict) -> None:
+    #     """
+    #     Restore EMA weights from checkpoint after loading.
+    #     """
+    #     super().on_load_checkpoint(checkpoint)
         
-        # Check if EMA weights exist in checkpoint
-        state_dict = checkpoint.get('state_dict', {})
-        ema_keys = [key for key in state_dict.keys() if key.startswith('_ema.')]
+    #     # Check if EMA weights exist in checkpoint
+    #     state_dict = checkpoint.get('state_dict', {})
+    #     ema_keys = [key for key in state_dict.keys() if key.startswith('_ema.')]
         
-        if ema_keys:
-            if not hasattr(self, '_ema') or self._ema is None:
-                self._ema = EMA(
-                    self.model,
-                    beta=self.cfg.model.ema_decay,
-                    update_every=self.cfg.model.ema_update_interval,
-                )
+    #     if ema_keys:
+    #         if not hasattr(self, '_ema') or self._ema is None:
+    #             self._ema = EMA(
+    #                 self.model,
+    #                 beta=self.cfg.model.ema_decay,
+    #                 update_every=self.cfg.model.ema_update_interval,
+    #             )
             
-            # Load EMA weights into the EMA helper
-            ema_state_dict = {}
-            for key, value in state_dict.items():
-                if key.startswith('_ema.ema_model.'):
-                    # Map '_ema.ema_model.*' -> 'ema_model.*' (remove the _ema prefix)
-                    ema_key = key.replace('_ema.ema_model.', 'ema_model.')
-                    ema_state_dict[ema_key] = value
+    #         # Load EMA weights into the EMA helper
+    #         ema_state_dict = {}
+    #         for key, value in state_dict.items():
+    #             if key.startswith('_ema.ema_model.'):
+    #                 # Map '_ema.ema_model.*' -> 'ema_model.*' (remove the _ema prefix)
+    #                 ema_key = key.replace('_ema.ema_model.', 'ema_model.')
+    #                 ema_state_dict[ema_key] = value
             
-            if ema_state_dict:
-                print(f"Loading {len(ema_state_dict)} EMA weights from checkpoint")
-                self._ema.ema_model.load_state_dict(ema_state_dict, strict=False)
-            else:
-                raise ValueError("No EMA model weights found in checkpoint")
-        else:
-            raise ValueError("No EMA keys found in checkpoint")
+    #         if ema_state_dict:
+    #             print(f"Loading {len(ema_state_dict)} EMA weights from checkpoint")
+    #             self._ema.ema_model.load_state_dict(ema_state_dict, strict=False)
+    #         else:
+    #             raise ValueError("No EMA model weights found in checkpoint")
+    #     else:
+    #         raise ValueError("No EMA keys found in checkpoint")
 
     @torch.no_grad()
     def model_predictions(

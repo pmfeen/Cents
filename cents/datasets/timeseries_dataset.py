@@ -332,6 +332,18 @@ class TimeSeriesDataset(Dataset):
         df = self._normalizer.inverse_transform(df)
         return self.merge_timeseries_columns(df) if merged else df
 
+    def apply_pretrained_normalizer(self) -> None:
+        """
+        Transform self.data with the attached pretrained normalizer (e.g. after
+        dataset._normalizer = data_generator.normalizer). Use when normalize=False
+        was set to avoid training but you still want real data in normalized space.
+        """
+        if getattr(self, "_normalizer", None) is None:
+            return
+        df_split = self.split_timeseries(self.data.copy())
+        self.data = self.merge_timeseries_columns(self._normalizer.transform(df_split))
+        self.data = self.data.reset_index(drop=True)
+
     def _encode_context_vars(
         self, data: pd.DataFrame
     ) -> Tuple[pd.DataFrame, Dict[str, Any]]:

@@ -110,6 +110,9 @@ class Evaluator:
             if data_generator.normalizer is not None:
                 dataset._normalizer = data_generator.normalizer
                 print("[Cents] Using pre-trained normalizer from DataGenerator")
+                if not getattr(dataset.cfg, "normalize", True):
+                    dataset.apply_pretrained_normalizer()
+                    print("[Cents] Normalized dataset with pretrained normalizer")
         else:
             if not model:
                 model = self.get_trained_model(dataset)
