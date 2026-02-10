@@ -89,12 +89,6 @@ class MLPStatsHead(nn.Module):
             end = 2 * D
             out_layer.bias[start:end].fill_(log_sigma_bias)
 
-            # If you want, you can also bias z_min/z_max to plausible values here when do_scale=True
-            # Example (optional):
-            # if self.do_scale:
-            #     out_layer.bias[2*D:3*D].fill_(-2.0)  # z_min
-            #     out_layer.bias[3*D:4*D].fill_( 2.0)  # z_max
-
         # Sanity: ensure output dimension matches expectation
         expected_out = K * D
         if out_layer.out_features != expected_out:
@@ -196,6 +190,7 @@ class _NormalizerModule(nn.Module):
         
         # Use registry to get the stats head class
         StatsHeadCls = get_stats_head_cls(stats_head_type)
+        print(do_scale, "do_scale")
         self.stats_head = StatsHeadCls(
             embedding_dim=self.embedding_dim,
             hidden_dim=hidden_dim,

@@ -1,14 +1,12 @@
 strategy: ddp_find_unused_parameters_true
 accelerator: gpu
 devices: 2,3
-precision: 16-mixed
 log_every_n_steps: 1
 hidden_dim: 512
 embedding_dim: 256
 n_epochs: 2000
 batch_size: 4096
 lr: 3e-4
-gradient_clip_val: 1.0
 save_cycle: 5000
 eval_after_training: False
 loss_type: mse  # Options: "mse" or "gaussian_nll"

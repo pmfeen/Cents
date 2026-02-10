@@ -246,7 +246,7 @@ class TimeSeriesDataset(Dataset):
 
         self._normalize_continuous_vars()
         return DataLoader(
-            self, batch_size=batch_size, shuffle=shuffle, num_workers=8, persistent_workers=persistent_workers
+            self, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, persistent_workers=persistent_workers
         )
 
     def split_timeseries(self, df: pd.DataFrame) -> pd.DataFrame:
