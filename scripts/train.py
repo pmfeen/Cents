@@ -8,6 +8,7 @@ from cents.datasets.airquality import AirQualityDataset
 from cents.datasets.vehicle import VehicleDataset
 from cents.trainer import Trainer
 from cents.utils.utils import set_context_config_path, set_context_overrides, get_context_config
+from cents.utils.config_loader import load_yaml, apply_overrides
 from omegaconf import OmegaConf
 import warnings
 import argparse
@@ -16,6 +17,21 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "runs"
+CONFIG_DATASET_DIR = PROJECT_ROOT / "cents" / "config" / "dataset"
+
+
+def _load_dataset_config(dataset_name: str, overrides: list) -> OmegaConf:
+    """Load dataset-specific config from config/dataset/{dataset_name}.yaml and apply overrides."""
+    config_path = CONFIG_DATASET_DIR / f"{dataset_name}.yaml"
+    if not config_path.exists():
+        raise ValueError(
+            f"Dataset config not found for '{dataset_name}' at {config_path}. "
+            f"Available: {[p.name for p in CONFIG_DATASET_DIR.glob('*.yaml')]}"
+        )
+    cfg = load_yaml(str(config_path))
+    if overrides:
+        cfg = apply_overrides(cfg, overrides)
+    return cfg
 
 
 def _write_run_summary(run_dir: Path, run_name: str, trainer: Trainer) -> None:
@@ -56,27 +72,33 @@ def main(args) -> None:
     if args.context_overrides:
         set_context_overrides(args.context_overrides)
 
+    # Build dataset-specific overrides (key=value list; config is loaded from config/dataset/{dataset}.yaml)
+    dataset_overrides = [f"skip_heavy_processing={args.skip_heavy_processing}"]
+    if args.dataset == "pecanstreet":
+        dataset_overrides.extend(["time_series_dims=1", "user_group=all"])
+    dataset_cfg = _load_dataset_config(args.dataset, dataset_overrides)
+
     if args.dataset == "pecanstreet":
         dataset = PecanStreetDataset(
-            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}, time_series_dims=1, user_group=all"],
+            cfg=dataset_cfg,
             force_retrain_normalizer=args.force_retrain_normalizer,
             run_dir=str(run_dir),
         )
     elif args.dataset == "commercial":
         dataset = CommercialDataset(
-            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
+            cfg=dataset_cfg,
             force_retrain_normalizer=args.force_retrain_normalizer,
             run_dir=str(run_dir),
         )
     elif args.dataset == "airquality":
         dataset = AirQualityDataset(
-            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
+            cfg=dataset_cfg,
             force_retrain_normalizer=args.force_retrain_normalizer,
             run_dir=str(run_dir),
         )
     elif args.dataset == "vehicle":
         dataset = VehicleDataset(
-            overrides=[f"skip_heavy_processing={args.skip_heavy_processing}"],
+            cfg=dataset_cfg,
             force_retrain_normalizer=args.force_retrain_normalizer,
             run_dir=str(run_dir),
         )

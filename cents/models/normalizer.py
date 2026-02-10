@@ -372,6 +372,21 @@ class Normalizer(NormalizerModel):
         self.sample_stats = []
         self._verify_parameters()
 
+    def load_state_dict(self, state_dict, strict: bool = True, **kwargs):
+        """
+        Load state dict with backward compatibility: remap legacy key
+        normalizer_model.cond_module -> normalizer_model.static_cond_module.
+        """
+        state_dict = dict(state_dict)
+        remapped = {}
+        for k, v in state_dict.items():
+            if k.startswith("normalizer_model.cond_module."):
+                new_k = k.replace("normalizer_model.cond_module.", "normalizer_model.static_cond_module.", 1)
+                remapped[new_k] = v
+            else:
+                remapped[k] = v
+        return super().load_state_dict(remapped, strict=strict, **kwargs)
+
     def _verify_parameters(self):
         """
         Verify that all parameters including context module are registered.
