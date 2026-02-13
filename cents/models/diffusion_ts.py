@@ -398,8 +398,8 @@ class Diffusion_TS(GenerativeModel):
         #                    f"NaN count: {torch.isnan(x).sum()}, Inf count: {torch.isinf(x).sum()}")
         
         b = x.shape[0]
-        # t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
-        t = self.stratified_timesteps(b, self.num_timesteps, self.cfg.model.k_bins, device=self.device)
+        t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
+        # t = self.stratified_timesteps(b, self.num_timesteps, self.cfg.model.k_bins, device=self.device)
         embedding, cond_classification_logits = self._get_context_embedding(context_vars)
         
         # Check diffusion schedule parameters

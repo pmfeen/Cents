@@ -17,6 +17,7 @@ from cents.utils.utils import (
     get_device,
     get_normalizer_training_config,
     parse_dims_from_name,
+    get_context_config,
 )
 from cents.utils.config_loader import load_yaml, apply_overrides
 
@@ -246,6 +247,7 @@ class DataGenerator:
                 dataset_cfg=self.cfg.dataset,
                 normalizer_training_cfg=get_normalizer_training_config(),
                 dataset=self.dataset,
+                context_cfg=get_context_config(),
             )
             state = torch.load(normalizer_ckpt, map_location=device)
             sd = state.get("state_dict", state)

@@ -14,7 +14,7 @@ loss_type: l1 #l2
 training_objective: x0
 loss_weighting: uniform
 min_snr_gamma: 5.0
-beta_schedule: linear #linear diffusion ts paper uses linear schedule
+beta_schedule: cosine #linear diffusion ts paper uses linear schedule
 n_heads: 4
 mlp_hidden_times: 4
 eta: 0.0

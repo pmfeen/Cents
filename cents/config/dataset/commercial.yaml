@@ -16,7 +16,7 @@ data_columns: ["dataid","energy_meter","timestamp"]
 metadata_columns: ["building_id", "site_id", "primaryspaceusage", "sqft", "yearbuilt"]
 numeric_context_bins: 5
 reduce_cardinality: False
-
+normalizer_stats_mode: group
 
 context_vars:
   year: ["categorical", 2]
@@ -24,5 +24,5 @@ context_vars:
   weekday: ["categorical", 7]
   site_id: ["categorical", 19]
   primaryspaceusage: ["categorical", 16]
-  sqft: ["continuous", null]
-  yearbuilt: ["continuous", null]
+  sqft: ["categorical", null]
+  yearbuilt: ["categorical", null]

@@ -22,7 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-DATASET_OVERRIDES = ["max_samples=10000"]
+DATASET_OVERRIDES = ["max_samples=10000", "normalize=False"]
 PECAN_OVERRIDES = ["time_series_dims=1", "user_group=all"]
 
 CONFIG_DATASET_DIR = Path(__file__).resolve().parent.parent / "cents" / "config" / "dataset"
@@ -236,8 +236,8 @@ def main() -> None:
     )
     cfg.dataset = OmegaConf.create(OmegaConf.to_container(dataset.cfg, resolve=True))
 
-    print("EVAL CONFIG:")
-    print(cfg)
+    # print("EVAL CONFIG:")
+    # print(cfg)
 
     # When loading from a local checkpoint, infer seq_len and time_series_dims from the
     # checkpoint so the model is built with the same architecture (avoids shape mismatch).

@@ -21,10 +21,6 @@ from cents.utils.utils import get_context_config
 
 @register_stats_head("default", "mlp")
 class MLPStatsHead(nn.Module):
-    """
-    Head module predicting summary statistics (mean, std, and optionally min/max z-scores) from context embedding.
-    """
-
     def __init__(
         self,
         embedding_dim: int,
@@ -33,16 +29,6 @@ class MLPStatsHead(nn.Module):
         do_scale: bool,
         n_layers: int = 3,
     ):
-        """
-        Initializes the statistics head network.
-
-        Args:
-            embedding_dim: Dimensionality of the input context embedding.
-            hidden_dim: Number of units in each hidden layer.
-            time_series_dims: Number of dimensions in the original time series.
-            do_scale: Whether to predict scaling min/max parameters.
-            n_layers: Number of hidden linear layers before the output.
-        """
         super().__init__()
         self.time_series_dims = time_series_dims
         self.do_scale = do_scale
@@ -56,77 +42,54 @@ class MLPStatsHead(nn.Module):
         layers.append(nn.Linear(in_dim, out_dim))
         self.net = nn.Sequential(*layers)
         
-        # Initialize the output layer properly
-        # For log_sigma, initialize to small negative values so exp(log_sigma) starts around 1
-        # This helps with training stability
         self._initialize_output_layer()
     
     def _initialize_output_layer(self, init_sigma: float = 1.0):
-        """
-        Initialize the last layer so log_sigma starts around log(init_sigma).
-        Assumes outputs are later reshaped as out.view(B, K, D) where K=2 or 4.
-        Therefore log_sigma lives in the SECOND block: indices [D:2D) in the flattened vector.
-        """
-        assert init_sigma > 0.0, "init_sigma must be > 0"
         D = self.time_series_dims
         K = 4 if self.do_scale else 2
-
         out_layer = self.net[-1]
-        if not isinstance(out_layer, nn.Linear):
-            raise RuntimeError("Expected last module in self.net to be nn.Linear")
 
         with torch.no_grad():
-            # Reasonable default: keep biases at 0, then set log_sigma bias block.
-            nn.init.zeros_(out_layer.bias)
-
-            # Optional: small weights so output starts near the bias.
-            # (If you prefer PyTorch defaults, comment this out.)
             nn.init.xavier_uniform_(out_layer.weight, gain=0.01)
-
-            # Set log_sigma block bias
-            log_sigma_bias = np.log(init_sigma)
-            start = 1 * D
-            end = 2 * D
-            out_layer.bias[start:end].fill_(log_sigma_bias)
-
-        # Sanity: ensure output dimension matches expectation
-        expected_out = K * D
-        if out_layer.out_features != expected_out:
-            raise ValueError(
-                f"Output layer out_features={out_layer.out_features}, expected {expected_out} (K={K}, D={D})."
-            )
+            nn.init.zeros_(out_layer.bias)
+            
+            if self.do_scale:
+                # 1. Initialize z_min to -2.0
+                out_layer.bias[2 * D : 3 * D].fill_(-2.0)
+                
+                # 2. Initialize the RAW DELTA to ~4.0 
+                # Softplus(4.0) is approx 4.018. 
+                # z_max = -2.0 + 4.018 = 2.018 (Perfect starting point)
+                out_layer.bias[3 * D : 4 * D].fill_(4.0)
 
     @staticmethod
     def _soft_clamp_tanh(x: torch.Tensor, bound: float) -> torch.Tensor:
-        """
-        Smoothly maps x into [-bound, bound] using tanh.
-        """
         if bound <= 0:
             raise ValueError("bound must be > 0")
         return bound * torch.tanh(x / bound)    
 
     def forward(self, z: torch.Tensor):
-        """
-        Forward pass to compute predicted statistics.
-
-        Args:
-            z: Context embedding tensor of shape (batch_size, embedding_dim).
-
-        Returns:
-            pred_mu: Predicted means, shape (batch_size, time_series_dims).
-            pred_sigma: Predicted standard deviations, shape (batch_size, time_series_dims).
-            pred_z_min: Predicted min z-scores, or None if do_scale=False.
-            pred_z_max: Predicted max z-scores, or None if do_scale=False.
-            pred_log_sigma_unclamped: Unclamped log_sigma for loss computation.
-        """
         out = self.net(z)
         batch_size = out.size(0)
+        
         if self.do_scale:
             out = out.view(batch_size, 4, self.time_series_dims)
             pred_mu = out[:, 0, :]
             pred_log_sigma = out[:, 1, :]
+            
+            # z_min is predicted normally
             pred_z_min = out[:, 2, :]
-            pred_z_max = out[:, 3, :]
+            
+            # The 4th output is now the "raw delta"
+            raw_delta = out[:, 3, :]
+            
+            # Ensure the range is strictly positive (minimum 1e-4)
+            # F.softplus(x) = log(1 + exp(x))
+            actual_range = F.softplus(raw_delta) + 1e-4
+            
+            # Structurally guarantee z_max > z_min
+            pred_z_max = pred_z_min + actual_range
+            
         else:
             out = out.view(batch_size, 2, self.time_series_dims)
             pred_mu = out[:, 0, :]
@@ -134,11 +97,10 @@ class MLPStatsHead(nn.Module):
             pred_z_min = None
             pred_z_max = None
         
-        # Store unclamped version for loss computation BEFORE clamping
-        # This must be done before any operations that might break the computation graph
         pred_log_sigma_unclamped = pred_log_sigma
         pred_log_sigma_clamped = self._soft_clamp_tanh(pred_log_sigma, bound=10.0)
         pred_sigma = torch.exp(pred_log_sigma_clamped)
+        
         return pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped
 
 
@@ -156,20 +118,13 @@ class _NormalizerModule(nn.Module):
         do_scale: bool = True,
         stats_head_type: str = "mlp",
         dynamic_var_names: list[str] = None,
+        n_layers: int = 3,
     ):
-        """
-        Args:
-            static_cond_module: ContextModule instance for static context variables (categorical + continuous).
-            dynamic_cond_module: ContextModule instance for dynamic context variables (time_series).
-            hidden_dim: Hidden dimension size for the stats head.
-            time_series_dims: Number of time series dimensions.
-            do_scale: Whether to include scaling predictions.
-            stats_head_type: Type of stats head to use (from registry).
-        """
         super().__init__()
         self.static_cond_module = static_cond_module
         self.dynamic_cond_module = dynamic_cond_module
         self.dynamic_var_names = dynamic_var_names
+        
         # Determine embedding dimension from available modules
         if static_cond_module is not None:
             self.embedding_dim = static_cond_module.embedding_dim
@@ -180,7 +135,6 @@ class _NormalizerModule(nn.Module):
         
         # If both modules exist, combine their embeddings
         if static_cond_module is not None and dynamic_cond_module is not None:
-            # Combine embeddings from both modules
             combined_dim = static_cond_module.embedding_dim + dynamic_cond_module.embedding_dim
             self.combine_mlp = nn.Sequential(
                 nn.Linear(combined_dim, self.embedding_dim),
@@ -189,32 +143,20 @@ class _NormalizerModule(nn.Module):
         else:
             self.combine_mlp = None
         
-        # Use registry to get the stats head class
         StatsHeadCls = get_stats_head_cls(stats_head_type)
         self.stats_head = StatsHeadCls(
             embedding_dim=self.embedding_dim,
             hidden_dim=hidden_dim,
             time_series_dims=time_series_dims,
             do_scale=do_scale,
+            n_layers=n_layers,
         )
 
     def forward(self, context_vars_dict: dict):
-        """
-        Compute normalization parameters from categorical context.
-
-        Args:
-            context_vars_dict: Mapping of context variable names to label tensors.
-                             Static vars: single values (categorical: long, continuous: float)
-                             Dynamic vars: time series sequences (batch, seq_len)
-
-        Returns:
-            Tuple of (pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped).
-        """
         embeddings = []
         
         # Process static context variables
         if self.static_cond_module is not None:
-            # Filter static context variables
             static_vars = {
                 k: v for k, v in context_vars_dict.items()
                 if k not in getattr(self, '_dynamic_var_names', [])
@@ -230,7 +172,6 @@ class _NormalizerModule(nn.Module):
         
         # Process dynamic context variables
         if self.dynamic_cond_module is not None:
-            # Filter dynamic context variables
             dynamic_var_names = getattr(self, '_dynamic_var_names', [])
             dynamic_vars = {
                 k: v for k, v in context_vars_dict.items()
@@ -243,15 +184,11 @@ class _NormalizerModule(nn.Module):
                     for k, v in dynamic_vars.items()
                 }
                 dynamic_embedding, _ = self.dynamic_cond_module(dynamic_vars)
-                # Check for NaN in dynamic embedding
                 if torch.isnan(dynamic_embedding).any() or torch.isinf(dynamic_embedding).any():
-                    raise ValueError(
-                        f"NaN/Inf detected in dynamic embedding. "
-                        f"Dynamic vars: {list(dynamic_vars.keys())}"
-                    )
+                    raise ValueError(f"NaN/Inf detected in dynamic embedding.")
                 embeddings.append(dynamic_embedding)
         
-        # Combine embeddings if both exist
+        # Combine embeddings
         if len(embeddings) == 2:
             combined = torch.cat(embeddings, dim=1)
             embedding = self.combine_mlp(combined)
@@ -274,15 +211,8 @@ class Normalizer(NormalizerModel):
         dataset_cfg,
         normalizer_training_cfg,
         dataset,
+        context_cfg,
     ):
-        """
-        Initializes the Normalizer training module.
-
-        Args:
-            dataset_cfg: OmegaConf dataset config (provides context_vars, columns).
-            normalizer_training_cfg: Config for normalizer training (lr, batch_size).
-            dataset: Instance of TimeSeriesDataset containing data DataFrame.
-        """
         super().__init__()
         self.save_hyperparameters(ignore=["dataset"])
 
@@ -298,29 +228,25 @@ class Normalizer(NormalizerModel):
         self.static_context_vars = self.categorical_vars + self.continuous_vars
         self.context_vars = self.static_context_vars + self.dynamic_context_vars
         
-        self.time_series_cols = dataset_cfg.time_series_columns[
-            : dataset_cfg.time_series_dims
-        ]
+        self.time_series_cols = dataset_cfg.time_series_columns[: dataset_cfg.time_series_dims]
         self.time_series_dims = dataset_cfg.time_series_dims
         self.do_scale = dataset_cfg.scale
         self.seq_len = dataset_cfg.seq_len
-        self.num_ts_steps = getattr(dataset_cfg, "num_ts_steps", None)  # For dynamic context length
-
-        # Get context config
-        # context_cfg = get_context_config()
+        self.num_ts_steps = getattr(dataset_cfg, "num_ts_steps", None)
 
         self.static_module_type = self.dataset.static_module_type
         self.dynamic_module_type = self.dataset.dynamic_module_type
         self.stats_head_type = self.dataset.stats_head_type
-        
-        # Get loss type from config (default to "mse")
         self.loss_type = getattr(self.normalizer_training_cfg, "loss_type", "mse")
+
+        self.register_buffer("global_mu_mean", torch.tensor(0.0))
+        self.register_buffer("global_mu_std", torch.tensor(1.0))
+        self.register_buffer("global_log_sigma_mean", torch.tensor(0.0))
         
-        # Create static context module (for categorical + continuous)
+        # Create static context module
         self.static_context_module = None
         if self.static_context_vars:
             StaticContextModuleCls = get_context_module_cls(self.static_module_type)
-            # Filter context_vars to only static ones
             self.static_context_vars_dict = {
                 k: v for k, v in self.dataset.context_var_dict.items() 
                 if k in self.static_context_vars
@@ -330,16 +256,14 @@ class Normalizer(NormalizerModel):
                 256,
             )
 
-        # Create dynamic context module (for time_series)
+        # Create dynamic context module
         self.dynamic_context_module = None
         if self.dynamic_context_vars and self.dynamic_module_type is not None:
             DynamicContextModuleCls = get_context_module_cls("dynamic", self.dynamic_module_type)
-            # Filter context_vars to only dynamic ones
             dynamic_context_vars_dict = {
                 k: v for k, v in self.dataset_cfg.context_vars.items() 
                 if k in self.dynamic_context_vars
             }
-            # Use num_ts_steps for dynamic context length if available, otherwise seq_len
             dynamic_seq_len = self.num_ts_steps if self.num_ts_steps is not None else self.seq_len
             self.dynamic_context_module = DynamicContextModuleCls(
                 dynamic_context_vars_dict,
@@ -355,6 +279,7 @@ class Normalizer(NormalizerModel):
             do_scale=self.do_scale,
             stats_head_type=self.stats_head_type,
             dynamic_var_names=self.dynamic_context_vars,
+            n_layers=context_cfg.normalizer.n_layers,
         )
 
         # Will be populated in setup()
@@ -362,10 +287,6 @@ class Normalizer(NormalizerModel):
         self._verify_parameters()
 
     def _verify_parameters(self):
-        """
-        Verify that all parameters including context module are registered.
-        This helps debug parameter counting issues.
-        """
         all_param_names = [name for name, _ in self.named_parameters()]
         context_param_names = [name for name in all_param_names if 'cond_module' in name or 'context_module' in name]
         stats_head_param_names = [name for name in all_param_names if 'stats_head' in name]
@@ -373,7 +294,6 @@ class Normalizer(NormalizerModel):
         if not context_param_names:
             raise RuntimeError(
                 "Context module parameters not found! "
-                "Expected parameters with 'cond_module' in name. "
                 f"Found parameter names: {all_param_names[:10]}..."
             )
         
@@ -385,11 +305,31 @@ class Normalizer(NormalizerModel):
         """
         Lightning hook: prepare training data before training.
         """
-        # Compute per-sample statistics - no grouping needed
+        # Compute per-sample statistics
+        # Note: Using robust quantile scaling for targets to avoid outlier instability
         mode = getattr(self.dataset_cfg, "normalizer_stats_mode", "sample")
-        self.sample_stats = self._build_training_samples(mode, use_quantile_scale=False)
-        
-        # Log initial predictions to check if model is in the right ballpark
+        self.sample_stats = self._build_training_samples(mode, use_quantile_scale=True)
+
+        # --- COMPUTE GLOBAL TARGET STATS FOR SCALING ---
+        # 1. Global Mu Stats (for Z-score scaling)
+        all_mus = np.concatenate([s[2] for s in self.sample_stats])
+        self.target_mu_mean = torch.tensor(all_mus.mean(), dtype=torch.float32)
+        self.target_mu_std = torch.tensor(all_mus.std() + 1e-8, dtype=torch.float32)
+
+        # 2. Global Sigma Stats (for Log-Space Centering)
+        all_sigmas_concat = np.concatenate([s[3] for s in self.sample_stats])
+        # Calculate the mean of the logs (Geometric mean center)
+        self.target_log_sigma_mean = torch.tensor(np.log(all_sigmas_concat + 1e-8).mean(), dtype=torch.float32)
+
+        # Register buffers so they persist with model
+        self.global_mu_mean.fill_(self.target_mu_mean)
+        self.global_mu_std.fill_(self.target_mu_std)
+        self.global_log_sigma_mean.fill_(self.target_log_sigma_mean)
+
+        print(f"Global Target Stats: Mu Mean={self.target_mu_mean:.4f}, Mu Std={self.target_mu_std:.4f}")
+        print(f"Global Target Log Sigma Mean: {self.target_log_sigma_mean:.4f}")
+
+        # Log initial predictions
         if stage == "fit" or stage is None:
             self._log_initial_predictions()
     
@@ -397,189 +337,113 @@ class Normalizer(NormalizerModel):
         """Log initial model predictions to diagnose initialization issues."""
         self.eval()
         with torch.no_grad():
-            # Get a sample batch
             dataloader = self.train_dataloader()
             batch = next(iter(dataloader))
             cat_vars_dict, mu_t, sigma_t, zmin_t, zmax_t = batch
             
-            # Move to device
             device = next(self.parameters()).device
-            cat_vars_dict = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in cat_vars_dict.items()
-            }
+            cat_vars_dict = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in cat_vars_dict.items()}
             mu_t = mu_t.to(device)
             sigma_t = sigma_t.to(device)
             
+            # Predict (Returns Real Unscaled values via Forward)
             pred_mu, pred_sigma, pred_z_min, pred_z_max, _ = self(cat_vars_dict)
             
             print(f"\n[Initial Predictions]")
-            print(f"  Target mu: mean={mu_t.mean().item():.4f}, std={mu_t.std().item():.4f}, range=[{mu_t.min().item():.4f}, {mu_t.max().item():.4f}]")
-            print(f"  Predicted mu: mean={pred_mu.mean().item():.4f}, std={pred_mu.std().item():.4f}, range=[{pred_mu.min().item():.4f}, {pred_mu.max().item():.4f}]")
-            print(f"  Target sigma: mean={sigma_t.mean().item():.4f}, std={sigma_t.std().item():.4f}, range=[{sigma_t.min().item():.4f}, {sigma_t.max().item():.4f}]")
-            print(f"  Predicted sigma: mean={pred_sigma.mean().item():.4f}, std={pred_sigma.std().item():.4f}, range=[{pred_sigma.min().item():.4f}, {pred_sigma.max().item():.4f}]")
+            print(f"  Target mu: mean={mu_t.mean().item():.4f}, std={mu_t.std().item():.4f}")
+            print(f"  Predicted mu: mean={pred_mu.mean().item():.4f}, std={pred_mu.std().item():.4f}")
             print(f"  Initial loss_mu: {F.mse_loss(pred_mu, mu_t).item():.6f}")
-            print(f"  Initial loss_sigma: {F.mse_loss(pred_sigma, sigma_t).item():.6f}")
             print()
         
         self.train()
 
     def forward(self, cat_vars_dict: dict):
         """
-        Predict normalization parameters for a batch of categorical contexts.
-
-        Args:
-            cat_vars_dict: Mapping of context variable names to label tensors.
+        Predict normalization parameters.
+        Applies UNSCALING logic to convert network outputs back to real-world range.
 
         Returns:
-            Tuple of (pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped).
+            Tuple of (pred_mu_real, pred_sigma_real, pred_z_min, pred_z_max, pred_log_sigma_raw).
         """
-        return self.normalizer_model(cat_vars_dict)
+        # Get raw network outputs (scaled space)
+        pred_mu_raw, pred_sigma, pred_zmin, pred_zmax, pred_log_sigma_raw = self.normalizer_model(cat_vars_dict)
 
-    def _compute_loss_mse(self, pred_mu, pred_sigma, pred_log_sigma_unclamped, mu_t, sigma_t):
-        loss_mu = F.mse_loss(pred_mu, mu_t)
-        
-        # FIX: Clamp the target log sigma to a reasonable range 
-        # (e.g., nothing smaller than e^-5 approx 0.006)
-        target_log_sigma = torch.log(sigma_t + 1e-8)
-        target_log_sigma = torch.clamp(target_log_sigma, min=-5.0, max=10.0)
-        
-        # FIX: Use Huber Loss (SmoothL1Loss) instead of MSE for stability
-        loss_sigma = F.smooth_l1_loss(pred_log_sigma_unclamped, target_log_sigma)
-        
-        return loss_mu, loss_sigma
+        # 1. Unscale Mu: (NetworkOutput * GlobalStd) + GlobalMean
+        pred_mu_real = (pred_mu_raw * self.global_mu_std) + self.global_mu_mean
 
-    
-    def _compute_loss_gaussian_nll(self, pred_mu, pred_sigma, mu_t, sigma_t):
+        # 2. Unscale Sigma: exp(NetworkLogOutput + GlobalLogMean)
+        # Note: We reconstruct log_sigma first to ensure numerical stability
+        pred_log_sigma_real = pred_log_sigma_raw + self.global_log_sigma_mean
+        pred_sigma_real = torch.exp(pred_log_sigma_real)
+
+        return pred_mu_real, pred_sigma_real, pred_zmin, pred_zmax, pred_log_sigma_raw
+
+    def _compute_loss_mse(self, pred_mu_raw, pred_log_sigma_raw, mu_t_scaled, target_log_sigma_centered):
         """
-        Compute Gaussian Negative Log Likelihood loss.
-        
-        Treats target mu_t as observations from N(pred_mu, pred_sigma^2).
-        For sigma, still uses log-space MSE since it's a scale parameter.
-        
-        Args:
-            pred_mu: Predicted means
-            pred_sigma: Predicted standard deviations
-            mu_t: Target means (treated as observations)
-            sigma_t: Target standard deviations
-            
-        Returns:
-            loss_mu, loss_sigma
+        Compute MSE loss in the SCALED space.
         """
-        # Use Gaussian NLL for mu: treat mu_t as observations from N(pred_mu, pred_sigma^2)
-        # GaussianNLLLoss expects: input (mean), target (observations), var (variance)
-        # We need to ensure variance is positive and not too small
-        pred_var = torch.clamp(pred_sigma ** 2, min=1e-6)
-        gaussian_nll = nn.GaussianNLLLoss(reduction='mean')
-        loss_mu = gaussian_nll(pred_mu, mu_t, pred_var)
+        loss_mu = F.mse_loss(pred_mu_raw, mu_t_scaled)
         
-        # For sigma, still use log-space MSE (sigma is a scale parameter, not a location)
-        pred_log_sigma = torch.log(pred_sigma + 1e-8)
-        target_log_sigma = torch.log(sigma_t + 1e-8)
-        loss_sigma = F.mse_loss(pred_log_sigma, target_log_sigma)
+        # Use Huber Loss for Log Sigma to be robust against outliers
+        # Clamp targets slightly to prevent infinite loss if data is broken
+        target_log_sigma_centered = torch.clamp(target_log_sigma_centered, min=-10.0, max=10.0)
+        loss_sigma = F.smooth_l1_loss(pred_log_sigma_raw, target_log_sigma_centered, beta=1.0)
         
         return loss_mu, loss_sigma
 
     def training_step(self, batch, batch_idx: int):
-        """
-        Training step: regress predicted stats against true group stats.
-
-        Args:
-            batch: Tuple of (cat_vars_dict, mu, sigma, zmin, zmax).
-            batch_idx: Batch index.
-
-        Returns:
-            loss tensor.
-        """
         context_vars_dict, mu_t, sigma_t, zmin_t, zmax_t = batch
-        pred_mu, pred_sigma, pred_z_min, pred_z_max, pred_log_sigma_unclamped = self(context_vars_dict)
+        
+        # 1. Get RAW network outputs (scaled space) from internal model
+        # We call self.normalizer_model directly to avoid the unscaling logic in self.forward
+        # This gives us values that match the standardized targets
+        pred_mu_raw, _, pred_z_min, pred_z_max, pred_log_sigma_raw = self.normalizer_model(context_vars_dict)
 
-        # Compute loss based on loss_type
-        if self.loss_type == "mse":
-            loss_mu, loss_sigma = self._compute_loss_mse(
-                pred_mu, pred_sigma, pred_log_sigma_unclamped, mu_t, sigma_t
-            )
-        elif self.loss_type == "gaussian_nll":
-            loss_mu, loss_sigma = self._compute_loss_gaussian_nll(
-                pred_mu, pred_sigma, mu_t, sigma_t
-            )
-        else:
-            raise ValueError(
-                f"Unknown loss_type: {self.loss_type}. "
-                f"Supported types: 'mse', 'gaussian_nll'"
-            )
+        # 2. Scale Targets to match Network Space
+        
+        # Scale Mu: Z-score
+        mu_t_scaled = (mu_t - self.global_mu_mean) / self.global_mu_std
+        
+        # Scale Sigma: Log-Space Centering
+        target_log_sigma_centered = torch.log(sigma_t + 1e-8) - self.global_log_sigma_mean
 
+        # 3. Compute Loss
+        loss_mu, loss_sigma = self._compute_loss_mse(
+            pred_mu_raw, pred_log_sigma_raw, mu_t_scaled, target_log_sigma_centered
+        )
         
         total_loss = loss_mu + loss_sigma
 
+        # 4. Scaling parameters (z_min/z_max) - These are already naturally roughly scaled (-2 to 2)
+        # We use SmoothL1Loss to be robust to outliers
         if self.do_scale:
             if torch.isnan(pred_z_min).any() or torch.isnan(pred_z_max).any():
-                raise ValueError(
-                    f"NaN detected in scale predictions at batch {batch_idx}"
-                )
-            loss_zmin = F.mse_loss(pred_z_min, zmin_t)
-            loss_zmax = F.mse_loss(pred_z_max, zmax_t)
+                raise ValueError(f"NaN detected in scale predictions at batch {batch_idx}")
+            loss_zmin = F.smooth_l1_loss(pred_z_min, zmin_t, beta=1.0)
+            loss_zmax = F.smooth_l1_loss(pred_z_max, zmax_t, beta=1.0)
             total_loss += loss_zmin + loss_zmax
         else:
             loss_zmin = torch.tensor(0.0, device=total_loss.device)
             loss_zmax = torch.tensor(0.0, device=total_loss.device)
         
-        # Check for NaN in loss
         if torch.isnan(total_loss) or torch.isinf(total_loss):
-            raise ValueError(
-                f"NaN/Inf loss detected at batch {batch_idx}. "
-                f"loss_mu: {loss_mu.item():.6f}, loss_sigma: {loss_sigma.item():.6f}"
-            )
+            raise ValueError(f"NaN/Inf loss detected.")
         
-        # Log individual components to understand what's happening
+        # Log metrics
         self.log("train_loss", total_loss, prog_bar=True, sync_dist=True)
         self.log("loss_mu", loss_mu, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log("loss_sigma", loss_sigma, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-        if self.do_scale:
-            self.log("loss_zmin", loss_zmin, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
-            self.log("loss_zmax", loss_zmax, on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         
-        # Log prediction statistics to monitor if model is learning
-        if batch_idx % 100 == 0:  # Log every 100 batches to avoid spam
+        if batch_idx % 100 == 0:
             with torch.no_grad():
-                # Log shapes (as number of elements for logging purposes)
-                self.log("pred_mu_num_elements", pred_mu.numel(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("mu_t_num_elements", mu_t.numel(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("pred_mu_batch_size", pred_mu.shape[0] if len(pred_mu.shape) > 0 else 1, on_step=True, on_epoch=False)
-                self.log("pred_mu_dims", pred_mu.shape[1] if len(pred_mu.shape) > 1 else 1, on_step=True, on_epoch=False, sync_dist=True)
-                
-                # Log ranges
-                self.log("pred_mu_min", pred_mu.min(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("pred_mu_max", pred_mu.max(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("mu_t_min", mu_t.min(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("mu_t_max", mu_t.max(), on_step=True, on_epoch=False, sync_dist=True)
-                
-                # Log error statistics
-                mu_errors = (pred_mu - mu_t).abs()
-                mu_squared_errors = (pred_mu - mu_t) ** 2
-                self.log("mu_error_mean", mu_errors.mean(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("mu_error_max", mu_errors.max(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("mu_error_min", mu_errors.min(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("mu_squared_error_mean", mu_squared_errors.mean(), on_step=True, on_epoch=False, sync_dist=True)
-                self.log("mu_squared_error_max", mu_squared_errors.max(), on_step=True, on_epoch=False, sync_dist=True)
-                
-                # Log existing statistics
-                self.log("pred_mu_mean", pred_mu.mean(), on_step=True, on_epoch=True, sync_dist=True)
-                self.log("pred_mu_std", pred_mu.std(), on_step=True, on_epoch=True, sync_dist=True)
-                self.log("pred_sigma_mean", pred_sigma.mean(), on_step=True, on_epoch=True, sync_dist=True)
-                self.log("pred_sigma_std", pred_sigma.std(), on_step=True, on_epoch=True, sync_dist=True)
-                self.log("target_mu_mean", mu_t.mean(), on_step=True, on_epoch=True, sync_dist=True)
-                self.log("target_sigma_mean", sigma_t.mean(), on_step=True, on_epoch=True, sync_dist=True)
+                # Reconstruct real values for logging intelligibility
+                pred_mu_real = (pred_mu_raw * self.global_mu_std) + self.global_mu_mean
+                self.log("pred_mu_mean_real", pred_mu_real.mean(), on_step=True, on_epoch=False)
+                self.log("target_mu_mean_real", mu_t.mean(), on_step=True, on_epoch=False)
         
         return total_loss
 
     def configure_optimizers(self):
-        """
-        Configure optimizer for normalizer training.
-
-        Returns:
-            Adam optimizer instance.
-        """
         optimizer = torch.optim.Adam(
             self.parameters(), 
             lr=self.normalizer_training_cfg.lr,
@@ -587,154 +451,76 @@ class Normalizer(NormalizerModel):
             eps=1e-8,
             weight_decay=0.0
         )
-        
         return optimizer
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """
-        Monitor gradients after each training step to diagnose training issues.
-        """
-        if batch_idx % 100 == 0:  # Check every 100 batches
+        if batch_idx % 100 == 0:
             total_norm = 0.0
-            param_count = 0
-            zero_grad_count = 0
-            
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    param_norm = param.grad.data.norm(2)
+            for p in self.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
                     total_norm += param_norm.item() ** 2
-                    param_count += 1
-                    if param_norm.item() < 1e-8:
-                        zero_grad_count += 1
-                        print(name, "HAS ZERO GRAD")
-                else:
-                    # Parameter has no gradient - this might indicate a problem
-                    if 'cond_module' in name or 'stats_head' in name:
-                        # Only warn about important parameters
-                        pass
-            
             total_norm = total_norm ** (1. / 2)
-            
             self.log("grad_norm", total_norm, on_step=True, on_epoch=False)
-            self.log("params_with_grad", param_count, on_step=True, on_epoch=False)
-            
-            if total_norm < 1e-6:
-                print(f"[Warning] Very small gradient norm at batch {batch_idx}: {total_norm:.2e}")
-            if zero_grad_count > 0:
-                print(f"[Warning] {zero_grad_count} parameters have near-zero gradients at batch {batch_idx}")
 
     def train_dataloader(self):
-        """
-        Returns a DataLoader over per-group statistics samples.
-        """
         ds = self._create_training_dataset()
         return DataLoader(
             ds,
             batch_size=self.normalizer_training_cfg.batch_size,
             shuffle=True,
-            num_workers=4,  # Use fewer workers to reduce overhead
-            persistent_workers=True,  # Disable to avoid multiprocessing cleanup issues
-            pin_memory=torch.cuda.is_available(),  # Helps with GPU transfer
-            prefetch_factor=2,  # Reduce prefetch to avoid memory issues
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=torch.cuda.is_available(),
+            prefetch_factor=2,
         )
 
     def _compute_per_sample_stats(self) -> list:
-        """
-        Compute statistics for each individual sample.
-        This allows the model to learn context → normalization_params for all context types
-        (categorical, continuous, and dynamic) without requiring grouping.
-
-        Returns:
-            List of tuples: (context_vars_dict, mu_array, std_array, zmin_array, zmax_array)
-        """
+        # Same implementation as before
         df = self.dataset.data.copy()
         sample_stats = []
         continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
         
         for idx, row in df.iterrows():
             context_vars_dict = {}
-            
-            # Process static context variables (categorical + continuous)
             for var_name in self.static_context_vars:
                 if var_name in row:
                     if var_name in continuous_vars:
+                        # Normalize inputs using min-max if available, otherwise just cast
                         context_vars_dict[var_name] = torch.tensor(row[var_name], dtype=torch.float32)
                     else:
                         context_vars_dict[var_name] = torch.tensor(row[var_name], dtype=torch.long)
             
-            # Process dynamic context variables (time series)
             dynamic_ctx_dict = {}
             for var_name in self.dynamic_context_vars:
-                # Check for both the original name and context_ prefix (vehicle dataset uses context_ prefix)
-                ts_data = None
-                if var_name in row:
-                    ts_data = row[var_name]
-                
+                ts_data = row.get(var_name)
                 if ts_data is not None:
-                    if isinstance(ts_data, np.ndarray):
-                        dynamic_ctx_dict[var_name] = ts_data
-                    elif isinstance(ts_data, list):
+                    if isinstance(ts_data, (np.ndarray, list)):
                         dynamic_ctx_dict[var_name] = np.array(ts_data)
                     else:
-                        # If it's a scalar, repeat it to match the appropriate length
-                        # Use num_ts_steps if available (for dynamic context), otherwise seq_len
                         context_len = self.num_ts_steps if self.num_ts_steps is not None else self.seq_len
                         dynamic_ctx_dict[var_name] = np.full(context_len, ts_data)
             
-            # Compute statistics from this sample's target time series
             dimension_points = []
-            for d, col_name in enumerate(self.time_series_cols):
+            for col_name in self.time_series_cols:
                 arr = np.array(row[col_name], dtype=np.float32).flatten()
                 dimension_points.append(arr)
             
-            mu_array = np.array(
-                [pts.mean() for pts in dimension_points], dtype=np.float32
-            )
-            std_array = np.array(
-                [pts.std() + 1e-8 for pts in dimension_points], dtype=np.float32
-            )
+            mu_array = np.array([pts.mean() for pts in dimension_points], dtype=np.float32)
+            std_array = np.array([pts.std() + 1e-8 for pts in dimension_points], dtype=np.float32)
 
             if self.do_scale:
-                z_min_array = np.array(
-                    [
-                        (pts - mu).min() / std
-                        for pts, mu, std in zip(dimension_points, mu_array, std_array)
-                    ],
-                    dtype=np.float32,
-                )
-                z_max_array = np.array(
-                    [
-                        (pts - mu).max() / std
-                        for pts, mu, std in zip(dimension_points, mu_array, std_array)
-                    ],
-                    dtype=np.float32,
-                )
+                z_min_array = np.array([(pts - mu).min() / std for pts, mu, std in zip(dimension_points, mu_array, std_array)], dtype=np.float32)
+                z_max_array = np.array([(pts - mu).max() / std for pts, mu, std in zip(dimension_points, mu_array, std_array)], dtype=np.float32)
             else:
                 z_min_array = z_max_array = None
             
-            sample_stats.append((
-                context_vars_dict,
-                dynamic_ctx_dict,
-                mu_array,
-                std_array,
-                z_min_array,
-                z_max_array,
-            ))
+            sample_stats.append((context_vars_dict, dynamic_ctx_dict, mu_array, std_array, z_min_array, z_max_array))
         
         return sample_stats
 
     def _create_training_dataset(self) -> Dataset:
-        """
-        Build an internal Dataset yielding per-sample statistics.
-
-        Returns:
-            PyTorch Dataset of samples (context_vars_dict, mu, sigma, zmin, zmax).
-        """
         class _TrainSet(Dataset):
-            """
-            Adapter Dataset to wrap per-sample statistics for DataLoader.
-            """
-
             def __init__(self, samples, dynamic_context_vars, do_scale, dataset_cfg):
                 self.samples = samples
                 self.dynamic_context_vars = dynamic_context_vars
@@ -745,43 +531,15 @@ class Normalizer(NormalizerModel):
                 return len(self.samples)
 
             def __getitem__(self, idx: int):
-                """
-                Returns one training sample.
-
-                Args:
-                    idx: Index of the sample.
-
-                Returns:
-                    context_vars_dict: Tensor dict of context labels (static + dynamic).
-                    mu_t: True mean tensor.
-                    sigma_t: True std tensor.
-                    zmin_t: True min z-score tensor or None.
-                    zmax_t: True max z-score tensor or None.
-                """
                 context_vars_dict, dynamic_ctx_dict, mu_arr, sigma_arr, zmin_arr, zmax_arr = self.samples[idx]
-                
-                # Process dynamic context variables (time series) - convert to tensors
                 for var_name in self.dynamic_context_vars:
                     if var_name in dynamic_ctx_dict:
-                        ts_data = dynamic_ctx_dict[var_name]
-                        # Convert to tensor
-                        if isinstance(ts_data, np.ndarray):
-                            # Check if it's categorical (integer) or numeric (float)
-                            var_info = self.dataset_cfg.context_vars.get(var_name, None)
-                            if var_info and var_info[1] is not None:
-                                # Categorical time series
-                                context_vars_dict[var_name] = torch.from_numpy(ts_data).long()
-                            else:
-                                # Numeric time series
-                                context_vars_dict[var_name] = torch.from_numpy(ts_data).float()
+                        ts_data = np.array(dynamic_ctx_dict[var_name])
+                        var_info = self.dataset_cfg.context_vars.get(var_name, None)
+                        if var_info and var_info[1] is not None:
+                            context_vars_dict[var_name] = torch.from_numpy(ts_data).long()
                         else:
-                            # Fallback: convert to array first
-                            ts_array = np.array(ts_data)
-                            var_info = self.dataset_cfg.context_vars.get(var_name, None)
-                            if var_info and var_info[1] is not None:
-                                context_vars_dict[var_name] = torch.from_numpy(ts_array).long()
-                            else:
-                                context_vars_dict[var_name] = torch.from_numpy(ts_array).float()
+                            context_vars_dict[var_name] = torch.from_numpy(ts_data).float()
                 
                 mu_t = torch.from_numpy(mu_arr).float()
                 sigma_t = torch.from_numpy(sigma_arr).float()
@@ -792,32 +550,13 @@ class Normalizer(NormalizerModel):
         return _TrainSet(self.sample_stats, self.dynamic_context_vars, self.do_scale, self.dataset_cfg)
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Normalize a DataFrame of time series using learned parameters.
-
-        Pads or splits if needed, then applies z-score and min-max scaling.
-
-        Args:
-            df: Input DataFrame with raw time series columns.
-
-        Returns:
-            DataFrame with normalized series in same columns.
-        """
         missing = [c for c in self.time_series_cols if c not in df.columns]
-
         if missing:
             df = split_timeseries(df, self.time_series_cols)
-            missing = [c for c in self.time_series_cols if c not in df.columns]
-
-        assert not missing, (
-            "Normalizer.transform expects data in split format with columns "
-            f"{self.time_series_cols}."
-        )
+        
         df_out = df.copy()
         self.eval()
         continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
-        
-        # Get categorical time series from dataset if available
         categorical_ts = getattr(self.dataset, 'categorical_time_series', {})
         
         with torch.no_grad():
@@ -827,138 +566,109 @@ class Normalizer(NormalizerModel):
                     if v in continuous_vars:
                         ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
                     elif v in self.dynamic_context_vars:
-                        # Dynamic (time series) variable
-                        if v in categorical_ts:
-                            # Categorical time series - keep as long
-                            ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
-                        else:
-                            # Numeric time series - convert to float32
-                            ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
+                        dtype = torch.long if v in categorical_ts else torch.float32
+                        ctx[v] = torch.tensor(row[v], dtype=dtype).unsqueeze(0)
                     else:
-                        # Static categorical variable
                         ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
-                mu, sigma, zmin, zmax, _ = self(ctx)
-                mu, sigma = mu[0].cpu().numpy(), sigma[0].cpu().numpy()
+                
+                # self(ctx) calls forward, which automatically UNSCALES predictions
+                pred_mu, pred_sigma, pred_zmin, pred_zmax, _ = self(ctx)
+                mu, sigma = pred_mu[0].cpu().numpy(), pred_sigma[0].cpu().numpy()
 
                 for d, col in enumerate(self.time_series_cols):
-                    arr = np.asarray(row[col], dtype=np.float32)
-                    
-                    # Skip normalization for categorical time series
                     if col in categorical_ts:
-                        # Keep as integers, just ensure proper dtype
-                        df_out.at[i, col] = arr.astype(np.int32)
+                        df_out.at[i, col] = np.asarray(row[col]).astype(np.int32)
                         continue
                     
-                    # Normalize numeric time series
+                    arr = np.asarray(row[col], dtype=np.float32)
+
+                    if sigma[d] < 1e-4:
+                        print(f"[EXPLOSION ALERT] Row {i}, Col '{col}'")
+                        print(f"  -> Sigma is tiny: {sigma[d]:.8f}")
+                        print(f"  -> Raw Data Range: {arr.min()} to {arr.max()}")
+                        print(f"  -> This will multiply your data by {1/(sigma[d]+1e-8):.0f}x!")
+
                     z = (arr - mu[d]) / (sigma[d] + 1e-8)
                     if self.do_scale:
-                        zmin_, zmax_ = zmin[0, d].item(), zmax[0, d].item()
+                        zmin_, zmax_ = pred_zmin[0, d].item(), pred_zmax[0, d].item()
                         rng = (zmax_ - zmin_) + 1e-8
                         z = (z - zmin_) / rng
+
+                        if rng < 1e-4:
+                            print(f"[EXPLOSION ALERT] Row {i}, Col '{col}'")
+                            print(f"  -> Range Collapsed: z_min={zmin_:.4f}, z_max={zmax_:.4f}")
+                            print(f"  -> Range delta: {rng:.8f}")
+                            print(f"  -> This will multiply your data by {1/(rng+1e-8):.0f}x!")
+
+                            
                     df_out.at[i, col] = z
         return df_out
 
     def inverse_transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Denormalize a DataFrame of z-scored series back to original scale.
-
-        Args:
-            df: DataFrame with normalized series columns.
-
-        Returns:
-            DataFrame with denormalized series.
-        """
         missing = [c for c in self.time_series_cols if c not in df.columns]
-
         if missing:
             df = split_timeseries(df, self.time_series_cols)
-            missing = [c for c in self.time_series_cols if c not in df.columns]
-
-        assert not missing, (
-            "Normalizer.inverse_transform expects split format with columns "
-            f"{self.time_series_cols}."
-        )
 
         df_out = df.copy()
         self.eval()
         continuous_vars = getattr(self.dataset_cfg, "continuous_context_vars", None) or []
-        # Get categorical time series from dataset if available
         categorical_ts = getattr(self.dataset, 'categorical_time_series', {})
+        
         with torch.no_grad():
             for i, row in tqdm(df_out.iterrows(), total=len(df_out), desc="Inverse normalizing"):
                 ctx = {}
                 for v in self.context_vars:
                     if v in continuous_vars:
-                        # Static continuous variable
                         ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
                     elif v in self.dynamic_context_vars:
-                        # Dynamic (time series) variable
-                        if v in categorical_ts:
-                            # Categorical time series - keep as long
-                            ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
-                        else:
-                            # Numeric time series - convert to float32
-                            ctx[v] = torch.tensor(row[v], dtype=torch.float32).unsqueeze(0)
+                        dtype = torch.long if v in categorical_ts else torch.float32
+                        ctx[v] = torch.tensor(row[v], dtype=dtype).unsqueeze(0)
                     else:
                         ctx[v] = torch.tensor(row[v], dtype=torch.long).unsqueeze(0)
-                mu, sigma, zmin, zmax, _ = self(ctx)
-                mu, sigma = mu[0].cpu().numpy(), sigma[0].cpu().numpy()
+                
+                # self(ctx) calls forward, which automatically UNSCALES predictions
+                pred_mu, pred_sigma, pred_zmin, pred_zmax, _ = self(ctx)
+                mu, sigma = pred_mu[0].cpu().numpy(), pred_sigma[0].cpu().numpy()
 
                 for d, col in enumerate(self.time_series_cols):
                     z = np.asarray(row[col], dtype=np.float32)
                     if self.do_scale:
-                        zmin_, zmax_ = zmin[0, d].item(), zmax[0, d].item()
+                        zmin_, zmax_ = pred_zmin[0, d].item(), pred_zmax[0, d].item()
                         rng = (zmax_ - zmin_) + 1e-8
                         z = z * rng + zmin_
+                    
                     arr = z * (sigma[d] + 1e-8) + mu[d]
                     df_out.at[i, col] = arr
         return df_out
 
     def _build_training_samples(
         self,
-        mode: str = "sample",                 # "sample" or "group"
+        mode: str = "sample",
         group_vars: Optional[list[str]] = None,
-        use_quantile_scale: bool = False,     # if True: use q01/q99 instead of min/max for zlow/zhigh
-        q_low: float = 0.01,
-        q_high: float = 0.99,
+        use_quantile_scale: bool = False,
+        q_low: float = 0.02,
+        q_high: float = 0.98,
     ) -> list:
         """
-        Build training samples for the normalizer.
-
-        Returns a list of tuples:
-        (context_vars_dict, dynamic_ctx_dict, mu_array, std_array, zlow_array, zhigh_array)
-
-        - mode="sample": one tuple per row
-        - mode="group": one tuple per group (grouped by group_vars)
-
-        Notes:
-        - group mode is only well-defined for *static* variables. For dynamic context,
-            this function will raise unless you explicitly exclude them from grouping.
-        - continuous vars: if you keep them continuous (float), grouping by them is usually pointless.
-            In group mode, we therefore ignore continuous vars by default unless you explicitly put them in group_vars.
+        Build training samples.
+        Note: Quantile scaling (q_low/q_high) only affects z_min/z_max calculation,
+        not the mean/std targets.
         """
         assert mode in {"sample", "group"}, f"mode must be 'sample' or 'group', got {mode}"
 
         df = self.dataset.data.copy()
 
-        # Identify context types
         continuous_vars = set(getattr(self.dataset_cfg, "continuous_context_vars", None) or [])
-        dynamic_vars = set(self.dynamic_context_vars)  # time_series context vars
-        static_vars = [v for v in self.static_context_vars]  # categorical + continuous
+        dynamic_vars = set(self.dynamic_context_vars)
+        static_vars = [v for v in self.static_context_vars]
 
-        # Default grouping vars: static categorical only (exclude continuous + dynamic)
         if group_vars is None:
             group_vars = [v for v in static_vars if (v not in continuous_vars and v not in dynamic_vars)]
 
-        # Sanity: grouping by dynamic vars is almost always wrong (huge keys, high cardinality)
         bad = [v for v in group_vars if v in dynamic_vars]
         if bad:
-            raise ValueError(
-                f"group_vars contains dynamic(time_series) vars {bad}. "
-                f"Remove them or use mode='sample'."
-            )
+            raise ValueError(f"group_vars contains dynamic vars {bad}")
 
-        # Helper: compute stats from a single row's time series columns
         def _row_stats(row) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
             dim_points = []
             for d, col_name in enumerate(self.time_series_cols):
@@ -990,59 +700,53 @@ class Normalizer(NormalizerModel):
         if mode == "sample":
             for _, row in df.iterrows():
                 context_vars_dict = {}
-
-                # static vars
                 for v in static_vars:
-                    if v not in row:
-                        continue
+                    if v not in row: continue
                     if v in continuous_vars:
+                        # Ensure we store float for continuous, applying simple normalization if needed in dataset
                         context_vars_dict[v] = torch.tensor(row[v], dtype=torch.float32)
                     else:
                         context_vars_dict[v] = torch.tensor(row[v], dtype=torch.long)
 
-                # dynamic vars (store separately; TrainSet will tensorize them)
                 dynamic_ctx_dict = {}
                 for v in self.dynamic_context_vars:
-                    if v not in row:
-                        continue
+                    if v not in row: continue
                     ts_data = row[v]
-                    if isinstance(ts_data, np.ndarray):
-                        dynamic_ctx_dict[v] = ts_data
-                    elif isinstance(ts_data, list):
+                    if isinstance(ts_data, (np.ndarray, list)):
                         dynamic_ctx_dict[v] = np.array(ts_data)
                     else:
-                        # scalar -> repeat
                         L = self.num_ts_steps if self.num_ts_steps is not None else self.seq_len
                         dynamic_ctx_dict[v] = np.full(L, ts_data)
 
                 mu, std, zlow, zhigh = _row_stats(row)
-
                 samples.append((context_vars_dict, dynamic_ctx_dict, mu, std, zlow, zhigh))
 
             return samples
 
         # mode == "group"
-        # Build grouped stats by aggregating all points from rows in each group.
-        # Context dict comes from group key values.
+        # Pre-process continuous vars for grouping by binning
+        for v in group_vars:
+            if v in continuous_vars:
+                n_bins = getattr(self, "numeric_context_bins", 5)
+                df[v] = pd.cut(df[v], bins=n_bins, labels=False, include_lowest=True)
+
         grouped = df.groupby(group_vars, dropna=False)
 
         for group_key, gdf in grouped:
-            # group_key can be scalar or tuple depending on #group_vars
             if len(group_vars) == 1:
                 group_key = (group_key,)
 
             context_vars_dict = {}
             for i, v in enumerate(group_vars):
-                # group vars should be categorical by default; cast to long.
-                # if user explicitly included a continuous var in group_vars, keep float.
+                val = group_key[i]
                 if v in continuous_vars:
-                    context_vars_dict[v] = torch.tensor(group_key[i], dtype=torch.float32)
+                    if pd.isna(val): val = 0
+                    context_vars_dict[v] = torch.tensor(int(val), dtype=torch.long)
                 else:
-                    context_vars_dict[v] = torch.tensor(group_key[i], dtype=torch.long)
+                    context_vars_dict[v] = torch.tensor(val, dtype=torch.long)
 
-            dynamic_ctx_dict = {}  # undefined for grouping; keep empty
+            dynamic_ctx_dict = {} 
 
-            # Aggregate raw points per dim
             dim_points = [[] for _ in range(self.time_series_dims)]
             for _, row in gdf.iterrows():
                 for d, col_name in enumerate(self.time_series_cols):
@@ -1075,4 +779,3 @@ class Normalizer(NormalizerModel):
             samples.append((context_vars_dict, dynamic_ctx_dict, mu, std, zlow, zhigh))
 
         return samples
-
