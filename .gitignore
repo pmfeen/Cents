@@ -106,6 +106,7 @@ ENV/
 .*.swp
 
 # Repository Specific
+runs/
 cents/data/*
 cents/data/pecanstreet/*
 cents/data/commercial/*

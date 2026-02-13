@@ -1,3 +1,4 @@
+import csv
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -70,23 +71,28 @@ class Trainer:
         self.model = self._instantiate_model()
         self.pl_trainer = self._instantiate_trainer()
 
-    def fit(self) -> "Trainer":
+    def fit(self, ckpt_path: Optional[str] = None) -> "Trainer":
         """
         Start training.
+
+        Args:
+            ckpt_path: Optional path to checkpoint file (.ckpt) to resume training from.
+                      If provided, training will resume from this checkpoint.
 
         Returns:
             Self, to allow method chaining.
         """
         if self.model_type == "normalizer":
-            self.pl_trainer.fit(self.model)
+            self.pl_trainer.fit(self.model, ckpt_path=ckpt_path)
         else:
             train_loader = self.dataset.get_train_dataloader(
                 batch_size=self.cfg.trainer.batch_size,
                 shuffle=True,
-                num_workers=6,  # Maximum for 7.5GB/10GB GPU usage
+                num_workers=4,  # Maximum for 7.5GB/10GB GPU usage
                 persistent_workers=True,
             )
-            self.pl_trainer.fit(self.model, train_loader, None)
+            print(f"[Cents] Training model on {len(train_loader)} batches")
+            self.pl_trainer.fit(self.model, train_loader, None, ckpt_path=ckpt_path)
         return self
 
     def get_data_generator(self) -> DataGenerator:
@@ -169,6 +175,8 @@ class Trainer:
         if not hasattr(cfg, "run_dir") or not cfg.run_dir:
             timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             cfg.run_dir = str(PKG_ROOT / "outputs" / cfg.job_name / timestamp)
+        # Checkpoint dir: run_dir/checkpoints so run root stays clean
+        cfg.checkpoint_dir = str(Path(cfg.run_dir) / "checkpoints")
         return cfg
 
     def _instantiate_model(self):
@@ -194,18 +202,43 @@ class Trainer:
         """
         tc = self.cfg.trainer
         callbacks = []
+        # Build filename with optional context_module_type
+        filename_parts = [
+            self.cfg.dataset.name,
+            self.model_type,
+            f"dim{self.cfg.dataset.time_series_dims}"
+        ]
+        
+        # Add context_module_type from context config
+        from cents.utils.utils import get_context_config
+        context_cfg = get_context_config()
+        static_context_module_type = context_cfg.static_context.type
+        if static_context_module_type:
+            filename_parts.append(f"ctx{static_context_module_type}")
+
+        dynamic_context_module_type = context_cfg.dynamic_context.type
+        if dynamic_context_module_type:
+            filename_parts.append(f"dyn{dynamic_context_module_type}")
+        
+        # Add stats_head_type from context config
+        stats_head_type = context_cfg.normalizer.stats_head_type
+        if stats_head_type:
+            filename_parts.append(f"stats{stats_head_type}")
+        
+
+        checkpoint_dir = getattr(self.cfg, "checkpoint_dir", None) or str(Path(self.cfg.run_dir) / "checkpoints")
+        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
         callbacks.append(
             ModelCheckpoint(
-                dirpath=self.cfg.run_dir,
-                filename=(
-                    f"{self.cfg.dataset.name}_{self.model_type}"
-                    f"_dim{self.cfg.dataset.time_series_dims}"
-                ),
+                dirpath=checkpoint_dir,
+                filename="_".join(filename_parts),
                 save_last=tc.checkpoint.save_last,
                 save_on_train_epoch_end=True, ### Perhaps excessive
             )
         )
         callbacks.append(EvalAfterTraining(self.cfg, self.dataset))
+        if getattr(self.cfg, "run_dir", None):
+            callbacks.append(LogLossToCsv(self.cfg.run_dir))
         logger = False
         if getattr(self.cfg, "wandb", None) and self.cfg.wandb.enabled:
             logger = WandbLogger(
@@ -227,6 +260,41 @@ class Trainer:
             logger=logger,
             default_root_dir=self.cfg.run_dir,
         )
+
+
+class LogLossToCsv(Callback):
+    """Append epoch loss values to runs/<run_name>/train_losses.csv."""
+
+    def __init__(self, run_dir: str):
+        super().__init__()
+        self.run_dir = Path(run_dir)
+        self._csv_path = self.run_dir / "train_losses.csv"
+        self._header_written = False
+
+    def _ensure_header(self, metric_names: List[str]) -> None:
+        if self._header_written:
+            return
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        with open(self._csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch"] + metric_names)
+        self._header_written = True
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        metrics = trainer.callback_metrics
+        if not metrics:
+            return
+        # Filter to loss-like keys and sort for consistent column order
+        loss_keys = sorted(k for k in metrics if "loss" in k.lower())
+        if not loss_keys:
+            return
+        self._ensure_header(loss_keys)
+        row = [trainer.current_epoch]
+        for k in loss_keys:
+            v = metrics[k]
+            row.append(float(v) if hasattr(v, "item") else float(v))
+        with open(self._csv_path, "a", newline="") as f:
+            csv.writer(f).writerow(row)
 
 
 class EvalAfterTraining(Callback):

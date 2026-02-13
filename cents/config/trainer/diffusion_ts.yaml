@@ -5,7 +5,7 @@ strategy: ddp_find_unused_parameters_true
 gradient_accumulate_every: 4
 log_every_n_steps: 1
 batch_size: 512
-max_epochs: 5000
+max_epochs: 2500
 base_lr: 1e-4
 eval_after_training: False
 
@@ -13,12 +13,12 @@ checkpoint:
   save_last: True       # Save final model
   save_top_k: 3         # Save top 3 best models
   every_n_train_steps: null
-  every_n_epochs: 500   # Save every 500 epochs
+  every_n_epochs: 20   # Save every 500 epochs
 
 lr_scheduler_params:
   factor: 0.5
   patience: 200
-  min_lr: 1.0e-5
+  min_lr: 1.0e-6
   threshold: 1.0e-1
   threshold_mode: rel
   verbose: false

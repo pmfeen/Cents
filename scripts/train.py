@@ -1,37 +1,120 @@
 from datetime import datetime
-import pandas as pd
+import yaml
+from pathlib import Path
 
 from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
+from cents.datasets.airquality import AirQualityDataset
 from cents.trainer import Trainer
-from pytorch_lightning.callbacks import EarlyStopping
+from cents.utils.utils import set_context_config_path, set_context_overrides, get_context_config
+from cents.utils.config_loader import load_yaml, apply_overrides
+from omegaconf import OmegaConf
+import warnings
+import argparse
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+RUNS_DIR = PROJECT_ROOT / "runs"
+CONFIG_DATASET_DIR = PROJECT_ROOT / "cents" / "config" / "dataset"
 
 
-def main() -> None:
-    MODEL_NAME = "diffusion_ts"
-    CR_LOSS_WEIGHT = 0.1
-    TC_LOSS_WEIGHT = 0.1
-    # Skip heavy processing for DDP compatibility
-    dataset = CommercialDataset(
-        skip_heavy_processing=True
-    )
+def _load_dataset_config(dataset_name: str, overrides: list) -> OmegaConf:
+    """Load dataset-specific config from config/dataset/{dataset_name}.yaml and apply overrides."""
+    config_path = CONFIG_DATASET_DIR / f"{dataset_name}.yaml"
+    if not config_path.exists():
+        raise ValueError(
+            f"Dataset config not found for '{dataset_name}' at {config_path}. "
+            f"Available: {[p.name for p in CONFIG_DATASET_DIR.glob('*.yaml')]}"
+        )
+    cfg = load_yaml(str(config_path))
+    if overrides:
+        cfg = apply_overrides(cfg, overrides)
+    return cfg
+
+
+def _write_run_summary(run_dir: Path, run_name: str, trainer: Trainer) -> None:
+    """Write a summary YAML of run choices (context, model, dataset, trainer) to run_dir."""
+    cfg = trainer.cfg
+    context_cfg = get_context_config()
+    summary = {
+        "run_name": run_name,
+        "run_dir": str(run_dir),
+        "dataset": OmegaConf.to_container(cfg.dataset, resolve=True) if hasattr(cfg, "dataset") and cfg.dataset else {},
+        "model": OmegaConf.to_container(cfg.model, resolve=True) if hasattr(cfg, "model") and cfg.model else {},
+        "context": OmegaConf.to_container(context_cfg, resolve=True) if context_cfg else {},
+        "trainer": OmegaConf.to_container(cfg.trainer, resolve=True) if hasattr(cfg, "trainer") and cfg.trainer else {},
+    }
+    path = run_dir / "summary.yaml"
+    with open(path, "w") as f:
+        yaml.dump(summary, f, default_flow_style=False, sort_keys=False)
+    print(f"[Cents] Wrote run summary to {path}")
+
+
+def main(args) -> None:
+    MODEL_NAME = args.model_name
+    CR_LOSS_WEIGHT = args.cr_loss_weight
+    TC_LOSS_WEIGHT = args.tc_loss_weight
+    run_name = args.run_name
+
+    # Create run directory under runs/
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    run_dir = RUNS_DIR / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Cents] Run directory: {run_dir}")
+
+    # Set custom context config path if provided
+    if args.context_config_path:
+        set_context_config_path(args.context_config_path)
+
+    # Set context config overrides if provided
+    if args.context_overrides:
+        set_context_overrides(args.context_overrides)
+
+    # Build dataset-specific overrides (key=value list; config is loaded from config/dataset/{dataset}.yaml)
+    dataset_overrides = [f"skip_heavy_processing={args.skip_heavy_processing}"]
+    if args.dataset == "pecanstreet":
+        dataset_overrides.extend(["time_series_dims=1", "user_group=all"])
+    dataset_cfg = _load_dataset_config(args.dataset, dataset_overrides)
+
+    if args.dataset == "pecanstreet":
+        dataset = PecanStreetDataset(
+            cfg=dataset_cfg,
+            force_retrain_normalizer=args.force_retrain_normalizer,
+            run_dir=str(run_dir),
+        )
+    elif args.dataset == "commercial":
+        dataset = CommercialDataset(
+            cfg=dataset_cfg,
+            force_retrain_normalizer=args.force_retrain_normalizer,
+            run_dir=str(run_dir),
+        )
+    elif args.dataset == "airquality":
+        dataset = AirQualityDataset(
+            cfg=dataset_cfg,
+            force_retrain_normalizer=args.force_retrain_normalizer,
+            run_dir=str(run_dir),
+        )
+    else:
+        raise ValueError(f"Dataset {args.dataset} not supported")
+
+    print("Initialized Dataset")
 
     trainer_overrides = [
-        "trainer.max_epochs=5000",
-        # "trainer.strategy=ddp_spawn",
-        "trainer.devices=1,2,3",  # Exclude GPU 0, use GPUs 1,2,3
-        # "trainer.devices=1",
-        "trainer.eval_after_training=True",
-        "train.accelerator=gpu",
-        # "train.accelerator=cpu",
-        "trainer.early_stopping.patience=100",  # Stop if no improvement for 100 epochs
-        "trainer.early_stopping.monitor=train_loss",  # Monitor training loss
-        "trainer.early_stopping.mode=min",  # Stop when loss stops decreasing
-        "trainer.enable_checkpointing=True",  # Explicitly enable checkpointing
-        "trainer.logger=False",  # Disable logger to see checkpoint messages
-        "wandb.enabled=False",
-        "wandb.project=cents",
-        "wandb.entity=pmfeen-massachusetts-institute-of-technology",
+        f"run_dir={run_dir}",
+        f"trainer.max_epochs={args.epochs}",
+        f"trainer.strategy={args.ddp_strategy}",
+        f"trainer.devices={args.devices}",
+        f"trainer.eval_after_training={args.eval_after_training}",
+        f"train.accelerator={args.accelerator}",
+        "trainer.early_stopping.patience=100",
+        "trainer.early_stopping.monitor=train_loss",
+        "trainer.early_stopping.mode=min",
+        f"trainer.enable_checkpointing={args.enable_checkpointing}",
+        "trainer.logger=False",
+        f"wandb.enabled={args.wandb_enabled}",
+        f"wandb.project={args.wandb_project}",
+        f"wandb.entity={args.wandb_entity}",
         f"model.context_reconstruction_loss_weight={CR_LOSS_WEIGHT}",
         f"model.tc_loss_weight={TC_LOSS_WEIGHT}",
         f"wandb.name=training_dai_{MODEL_NAME}_{datetime.now().strftime('%Y%m%d-%H%M%S')}_L{CR_LOSS_WEIGHT}_TC_{TC_LOSS_WEIGHT}_dim2",
@@ -43,11 +126,43 @@ def main() -> None:
         overrides=trainer_overrides,
     )
 
-    trainer.fit()
+    _write_run_summary(run_dir, run_name, trainer)
+
+    trainer.fit(ckpt_path=args.resume_from_checkpoint)
 
 if __name__ == "__main__":
-    import os
-    # Enable CUDA debugging for better error messages
-    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-    os.environ["TORCH_USE_CUDA_DSA"] = "1"
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--devices", type=str, default="auto")
+    parser.add_argument("--accelerator", type=str, default="gpu")
+    parser.add_argument("--model_name", type=str, default="diffusion_ts")
+    parser.add_argument("--cr_loss_weight", type=float, default=0.1)
+    parser.add_argument("--tc_loss_weight", type=float, default=0.1)
+    parser.add_argument("--dataset", type=str, default="pecanstreet")
+    parser.add_argument("--epochs", type=int, default=5000)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--wandb-enabled", action="store_true",
+                        help="Enable Weights and Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="cents")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--eval_after_training", action="store_true",
+                        help="Evaluate after training")
+    parser.add_argument("--skip_heavy_processing", action="store_true",
+                        help="Skip heavy processing of dataset")
+    parser.add_argument("--ddp-strategy", type=str, default="ddp_find_unused_parameters_true")
+    parser.add_argument("--enable_checkpointing", action="store_true",
+                        help="Enable checkpointing")
+    parser.add_argument("--context-config-path", type=str, default=None, 
+                        help="Path to custom context config YAML file (optional)")
+    parser.add_argument("--context-overrides", type=str, nargs="*", default=[],
+                        help="Override context config values (e.g., 'static_context.type=mlp' 'dynamic_context.type=cnn')")
+    parser.add_argument("--force-retrain-normalizer", action="store_true",
+                        help="Force retraining of normalizer even if cached version exists")
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None,
+        help="Path to checkpoint file (.ckpt) to resume training from",
+    )
+    parser.add_argument("--run-name", type=str, required=True,
+        help="Name of this run. A directory runs/<run-name> will be created for checkpoints, cache, and summary.",
+    )
+
+    args = parser.parse_args()
+    main(args)

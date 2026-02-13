@@ -106,11 +106,16 @@ class Evaluator:
         if data_generator is not None:
             if data_generator.model is not None:
                 model = data_generator.model
+                print(f"[Cents] Using pre-trained model from DataGenerator")
             if data_generator.normalizer is not None:
                 dataset._normalizer = data_generator.normalizer
-                print("[CENTS] Using pre-trained normalizer from DataGenerator")
-        elif not model:
-            model = self.get_trained_model(dataset)
+                print("[Cents] Using pre-trained normalizer from DataGenerator")
+                if not getattr(dataset.cfg, "normalize", True):
+                    dataset.apply_pretrained_normalizer()
+                    print("[Cents] Normalized dataset with pretrained normalizer")
+        else:
+            if not model:
+                model = self.get_trained_model(dataset)
 
         model.to(self.device)
         model.eval()
@@ -224,29 +229,42 @@ class Evaluator:
             rare_syn_data = syn_data[mask]
             rare_real_df = real_data_frame[mask].reset_index(drop=True)
 
-            dtw_mean_r, dtw_std_r = dynamic_time_warping_dist(
-                rare_real_data, rare_syn_data
-            )
-            rare_metrics["DTW"] = {"mean": dtw_mean_r, "std": dtw_std_r}
-            logger.info(f"[Cents] DTW completed")
+            # Check if rare subset has any valid samples
+            if len(rare_real_data) == 0:
+                logger.warning("[Cents] Rare subset is empty - skipping rare subset metrics")
+                rare_metrics = {
+                    "DTW": {"mean": float('nan'), "std": float('nan')},
+                    "MMD": {"mean": float('nan'), "std": float('nan')},
+                    "Context_FID": float('nan'),
+                    "Disc_Score": float('nan'),
+                    "Pred_Score": float('nan')
+                }
+            else:
+                logger.info(f"[Cents] Rare subset contains {len(rare_real_data)} samples")
+                
+                dtw_mean_r, dtw_std_r = dynamic_time_warping_dist(
+                    rare_real_data, rare_syn_data
+                )
+                rare_metrics["DTW"] = {"mean": dtw_mean_r, "std": dtw_std_r}
+                logger.info(f"[Cents] DTW completed")
 
-            mmd_mean_r, mmd_std_r = calculate_mmd(rare_real_data, rare_syn_data)
-            rare_metrics["MMD"] = {"mean": mmd_mean_r, "std": mmd_std_r}
-            logger.info(f"[Cents] MMD completed")
+                mmd_mean_r, mmd_std_r = calculate_mmd(rare_real_data, rare_syn_data)
+                rare_metrics["MMD"] = {"mean": mmd_mean_r, "std": mmd_std_r}
+                logger.info(f"[Cents] MMD completed")
 
-            fid_score_r = Context_FID(rare_real_data, rare_syn_data)
-            rare_metrics["Context_FID"] = fid_score_r
-            logger.info(f"[Cents] Context-FID completed")
+                fid_score_r = Context_FID(rare_real_data, rare_syn_data)
+                rare_metrics["Context_FID"] = fid_score_r
+                logger.info(f"[Cents] Context-FID completed")
 
-            discr_score_r, _, _ = discriminative_score_metrics(
-                rare_real_data, rare_syn_data
-            )
-            rare_metrics["Disc_Score"] = discr_score_r
-            logger.info(f"[Cents] Discr Score completed")
+                discr_score_r, _, _ = discriminative_score_metrics(
+                    rare_real_data, rare_syn_data
+                )
+                rare_metrics["Disc_Score"] = discr_score_r
+                logger.info(f"[Cents] Discr Score completed")
 
-            pred_score_r = predictive_score_metrics(rare_real_data, rare_syn_data)
-            rare_metrics["Pred_Score"] = pred_score_r
-            logger.info(f"[Cents] Pred Score completed")
+                pred_score_r = predictive_score_metrics(rare_real_data, rare_syn_data)
+                rare_metrics["Pred_Score"] = pred_score_r
+                logger.info(f"[Cents] Pred Score completed")
 
             logger.info("[Cents] Done computing Rare-Subset Metrics.")
             metrics["rare_subset"] = rare_metrics
@@ -333,12 +351,12 @@ class Evaluator:
         """
         dataset.data = dataset.get_combined_rarity()
         real_data_subset = dataset.data.iloc[indices].reset_index(drop=True)
-        context_vars = {
-            name: torch.tensor(
-                real_data_subset[name].values, dtype=torch.long, device=self.device
-            )
-            for name in dataset.context_vars
-        }
+        continuous_vars = getattr(dataset, "continuous_vars", [])
+        context_vars = {}
+        for name in dataset.context_vars:
+            vals = real_data_subset[name].values
+            dtype = torch.float32 if name in continuous_vars else torch.long
+            context_vars[name] = torch.tensor(vals, dtype=dtype, device=self.device)
 
         generated_ts = model.generate(context_vars).cpu().numpy()
         if generated_ts.ndim == 2:

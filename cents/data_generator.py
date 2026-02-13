@@ -46,16 +46,18 @@ class DataGenerator:
 
     def __init__(
         self,
-        model_name: str,
+        model_name: str = None,
+        model_type: str = None,
         device: str = None,
         cfg: DictConfig = None,
+        dataset = None,
         model: Optional[pl.LightningModule] = None,
         normalizer: Optional[Normalizer] = None,
     ):
         self.device = get_device(device)
         self.cfg = cfg
         self._ctx_buff: Dict[str, torch.Tensor] = {}
-
+        self.dataset = dataset
         if model is not None:
             self.model = model.to(self.device).eval()
             self.normalizer = normalizer
@@ -71,8 +73,22 @@ class DataGenerator:
             self.model = None
             self.normalizer = None
             self.load_pretrained(model_name)
+        elif model_type is not None:
+            # Init without loading - user will call load_from_checkpoint separately
+            self.model_type = model_type
+            self.model = None
+            self.normalizer = None
+            if dataset is not None:
+                self.cfg = cfg or OmegaConf.create({})
+                if not hasattr(self.cfg, 'dataset'):
+                    self.cfg.dataset = dataset.cfg
+                if not hasattr(self.cfg, 'model'):
+                    self.cfg.model = load_yaml(CONF_DIR / "model" / f"{model_type}.yaml")
+                self.set_dataset_spec(
+                    self.cfg.dataset, self._read_ctx_codes(self.cfg.dataset.name)
+                )
         else:
-            raise ValueError("Must provide either model_name or model instance.")
+            raise ValueError("Must provide either model_name, model_type, or model instance.")
 
     def _default_cfg(self) -> DictConfig:
         """
@@ -105,13 +121,15 @@ class DataGenerator:
         self.cfg.dataset = dataset_cfg
         self.ctx_code_book = ctx_codes
 
-    def set_context(self, auto_fill_missing: bool = False, **context_vars: int):
+    def set_context(self, auto_fill_missing: bool = False, **context_vars: Union[int, float]):
         """
         Define a context vector for subsequent generation calls.
 
         Args:
             auto_fill_missing: If True, randomly sample missing context variables.
             **context_vars: Named codes for each context variable.
+                For categorical variables: integer codes (int).
+                For continuous variables: float values (float).
 
         Raises:
             RuntimeError: If dataset spec has not been set.
@@ -123,25 +141,34 @@ class DataGenerator:
             )
 
         required = self.cfg.dataset.context_vars
+        continuous_vars = getattr(self.cfg.dataset, "continuous_context_vars", None) or []
         if auto_fill_missing:
             for var, n in required.items():
-                context_vars.setdefault(var, random.randrange(n))
+                if var in continuous_vars:
+                    # For continuous variables, sample from a reasonable range
+                    # This is a simple default - users should provide actual values
+                    context_vars[var] = random.uniform(0.0, 1.0)
+                else:
+                    context_vars.setdefault(var, random.randrange(n))
         else:
             missing = set(required) - set(context_vars)
             if missing:
                 raise ValueError(f"Missing context vars: {missing}")
 
+        self._ctx_buff = {}
         for var, code in context_vars.items():
-            max_cat = self.cfg.dataset.context_vars[var]
-            if not (0 <= code < max_cat):
-                raise ValueError(
-                    f"Context '{var}' must be in [0, {max_cat}); got {code}."
-                )
-
-        self._ctx_buff = {
-            var: torch.tensor(code, device=self.device)
-            for var, code in context_vars.items()
-        }
+            if var in continuous_vars:
+                # Continuous variables: use float tensor (no validation needed)
+                self._ctx_buff[var] = torch.tensor(code, dtype=torch.float32, device=self.device)
+            else:
+                # Categorical variables: validate and use long tensor
+                if var in required:
+                    max_cat = required[var]
+                    if not (0 <= code < max_cat):
+                        raise ValueError(
+                            f"Context '{var}' must be in [0, {max_cat}); got {code}."
+                        )
+                self._ctx_buff[var] = torch.tensor(code, dtype=torch.long, device=self.device)
 
     @torch.no_grad()
     def generate(self, n: int = 128) -> "pd.DataFrame":
@@ -193,7 +220,10 @@ class DataGenerator:
         ckpt_path, state = self._resolve_ckpt(model_ckpt)
         ModelCls = get_model_cls(self.model_type)
 
+        print(self.cfg)
+
         if ckpt_path.suffix == ".ckpt":
+            print(f"[Cents] Loading model from checkpoint: {ckpt_path}")
             self.model = (
                 ModelCls.load_from_checkpoint(
                     cfg=self.cfg,
@@ -215,7 +245,7 @@ class DataGenerator:
             self.normalizer = Normalizer(
                 dataset_cfg=self.cfg.dataset,
                 normalizer_training_cfg=get_normalizer_training_config(),
-                dataset=None,
+                dataset=self.dataset,
             )
             state = torch.load(normalizer_ckpt, map_location=device)
             sd = state.get("state_dict", state)
