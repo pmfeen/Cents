@@ -306,22 +306,6 @@ def main() -> None:
 
     # gen.set_dataset_spec(gen.model.cfg.dataset, dataset.get_context_var_codes())
     cfg.dataset = gen.model.cfg.dataset
-
-    with torch.no_grad():
-        betas = gen.model.betas
-        alphas = 1 - betas
-        abar = torch.cumprod(alphas, dim=0)
-        abar_prev = F.pad(abar[:-1], (1,0), value=1.0)
-
-        pv_expected = betas * (1 - abar_prev) / (1 - abar)
-        print((pv_expected - gen.model.posterior_variance).abs().max())
-
-        pmc1_expected = betas * abar_prev.sqrt() / (1 - abar)
-        pmc2_expected = (1 - abar_prev) * alphas.sqrt() / (1 - abar)
-
-        print((pmc1_expected - gen.model.posterior_mean_coef1).abs().max())
-        print((pmc2_expected - gen.model.posterior_mean_coef2).abs().max())
-
     
     logging.info("Checkpoint loaded. Starting evaluation...")
     results = Evaluator(cfg, dataset).evaluate_model(data_generator=gen)
