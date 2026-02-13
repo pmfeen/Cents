@@ -187,22 +187,22 @@ class SepMLPContextModule(BaseContextModule):
         # Process continuous variables (only those present in context_vars)
         for name, layer in self.continuous_projections.items():
             if name in context_vars:
-                # Reshape to (batch_size, 1) for linear layer
-                # Ensure proper shape and gradient flow
+                # # Reshape to (batch_size, 1) for linear layer
+                # # Ensure proper shape and gradient flow
                 continuous_val = context_vars[name]
-                # Handle different input shapes
-                if continuous_val.dim() == 0:
-                    # Scalar: add batch dimension
-                    continuous_val = continuous_val.unsqueeze(0)
-                elif continuous_val.dim() == 1:
-                    # 1D tensor: add feature dimension
-                    continuous_val = continuous_val.unsqueeze(-1)
-                # Ensure float type while preserving gradients
-                if not continuous_val.is_floating_point():
-                    continuous_val = continuous_val.float()    
+                # # Handle different input shapes
+                # if continuous_val.dim() == 0:
+                #     # Scalar: add batch dimension
+                #     continuous_val = continuous_val.unsqueeze(0)
+                # elif continuous_val.dim() == 1:
+                #     # 1D tensor: add feature dimension
+                #     continuous_val = continuous_val.unsqueeze(-1)
+                # # Ensure float type while preserving gradients
+                # if not continuous_val.is_floating_point():
+                #     continuous_val = continuous_val.float()    
 
-                if continuous_val.dim() == 1:
-                    continuous_val = continuous_val.unsqueeze(-1)
+                # if continuous_val.dim() == 1:
+                #     continuous_val = continuous_val.unsqueeze(-1)
                 encodings[name] = layer(continuous_val)
 
         embeddings = []        
@@ -223,28 +223,8 @@ class SepMLPContextModule(BaseContextModule):
                     )
                 embeddings.append(embedding_output)
 
-        if not embeddings:
-            raise ValueError("No context variables found in context_vars dict")
-
         context_matrix = torch.cat(embeddings, dim=1)
-        
-        # Check for NaN before mixing MLP
-        if torch.isnan(context_matrix).any():
-            raise ValueError(
-                f"NaN detected in context_matrix before mixing MLP. "
-                f"This suggests one of the context variable embeddings contains NaN."
-            )
-        
         embedding = self.mixing_mlp(context_matrix)
-        
-        # Check for NaN after mixing MLP
-        if torch.isnan(embedding).any():
-            raise ValueError(
-                f"NaN detected in final embedding after mixing MLP. "
-                f"Context matrix stats: mean={context_matrix.mean():.4f}, "
-                f"std={context_matrix.std():.4f}, "
-                f"min={context_matrix.min():.4f}, max={context_matrix.max():.4f}"
-            )
 
         classification_logits = {
             var_name: head(embedding)
@@ -259,8 +239,6 @@ class SepMLPContextModule(BaseContextModule):
             if var_name in context_vars
         }
         
-        # Combine both into a single dict for backward compatibility
-        # The training step will need to distinguish between them
         all_outputs = {**classification_logits, **regression_outputs}
 
         return embedding, all_outputs

@@ -155,6 +155,7 @@ class _NormalizerModule(nn.Module):
         time_series_dims: int = 2,
         do_scale: bool = True,
         stats_head_type: str = "mlp",
+        dynamic_var_names: list[str] = None,
     ):
         """
         Args:
@@ -168,7 +169,7 @@ class _NormalizerModule(nn.Module):
         super().__init__()
         self.static_cond_module = static_cond_module
         self.dynamic_cond_module = dynamic_cond_module
-        
+        self.dynamic_var_names = dynamic_var_names
         # Determine embedding dimension from available modules
         if static_cond_module is not None:
             self.embedding_dim = static_cond_module.embedding_dim
@@ -190,7 +191,6 @@ class _NormalizerModule(nn.Module):
         
         # Use registry to get the stats head class
         StatsHeadCls = get_stats_head_cls(stats_head_type)
-        print(do_scale, "do_scale")
         self.stats_head = StatsHeadCls(
             embedding_dim=self.embedding_dim,
             hidden_dim=hidden_dim,
@@ -293,10 +293,9 @@ class Normalizer(NormalizerModel):
         # Get continuous variables from config if specified
         self.continuous_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "continuous"]
         self.categorical_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "categorical"]
-        dynamic_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "time_series"]
+        self.dynamic_context_vars = [k for k, v in self.dataset_cfg.context_vars.items() if v[0] == "time_series"]
         
         self.static_context_vars = self.categorical_vars + self.continuous_vars
-        self.dynamic_context_vars = dynamic_vars
         self.context_vars = self.static_context_vars + self.dynamic_context_vars
         
         self.time_series_cols = dataset_cfg.time_series_columns[
@@ -318,7 +317,7 @@ class Normalizer(NormalizerModel):
         self.loss_type = getattr(self.normalizer_training_cfg, "loss_type", "mse")
         
         # Create static context module (for categorical + continuous)
-        static_context_module = None
+        self.static_context_module = None
         if self.static_context_vars:
             StaticContextModuleCls = get_context_module_cls(self.static_module_type)
             # Filter context_vars to only static ones
@@ -326,13 +325,13 @@ class Normalizer(NormalizerModel):
                 k: v for k, v in self.dataset.context_var_dict.items() 
                 if k in self.static_context_vars
             }
-            static_context_module = StaticContextModuleCls(
+            self.static_context_module = StaticContextModuleCls(
                 self.static_context_vars_dict,
                 256,
             )
 
         # Create dynamic context module (for time_series)
-        dynamic_context_module = None
+        self.dynamic_context_module = None
         if self.dynamic_context_vars and self.dynamic_module_type is not None:
             DynamicContextModuleCls = get_context_module_cls("dynamic", self.dynamic_module_type)
             # Filter context_vars to only dynamic ones
@@ -342,26 +341,21 @@ class Normalizer(NormalizerModel):
             }
             # Use num_ts_steps for dynamic context length if available, otherwise seq_len
             dynamic_seq_len = self.num_ts_steps if self.num_ts_steps is not None else self.seq_len
-            dynamic_context_module = DynamicContextModuleCls(
+            self.dynamic_context_module = DynamicContextModuleCls(
                 dynamic_context_vars_dict,
                 256,
                 seq_len=dynamic_seq_len,
             )
         
         self.normalizer_model = _NormalizerModule(
-            static_cond_module=static_context_module,
-            dynamic_cond_module=dynamic_context_module,
+            static_cond_module=self.static_context_module,
+            dynamic_cond_module=self.dynamic_context_module,
             hidden_dim=512,
             time_series_dims=self.time_series_dims,
             do_scale=self.do_scale,
             stats_head_type=self.stats_head_type,
+            dynamic_var_names=self.dynamic_context_vars,
         )
-        # Store dynamic var names for filtering in forward
-        self.normalizer_model._dynamic_var_names = self.dynamic_context_vars
-        # For backward compatibility, expose the static context module
-        self.context_module = self.normalizer_model.static_cond_module
-        # Expose the dynamic context module at top level so it shows in model summary
-        self.dynamic_cond_module = self.normalizer_model.dynamic_cond_module
 
         # Will be populated in setup()
         self.sample_stats = []

@@ -401,20 +401,6 @@ class Diffusion_TS(GenerativeModel):
         # t = torch.randint(0, self.num_timesteps, (b,), device=self.device)
         t = self.stratified_timesteps(b, self.num_timesteps, self.cfg.model.k_bins, device=self.device)
         embedding, cond_classification_logits = self._get_context_embedding(context_vars)
-        # Check embedding for NaN/Inf
-        # if embedding.isnan().any() or embedding.isinf().any():
-        #     raise ValueError(
-        #         f"NaN/Inf detected in embedding from context module. "
-        #         f"NaN count: {embedding.isnan().sum()}, Inf count: {embedding.isinf().sum()}, "
-        #         f"shape: {embedding.shape}, min: {embedding.min()}, max: {embedding.max()}"
-        #     )
-        
-        # Embedding should now be normalized by the context module (mean=0, std=1 per sample)
-        # Check that values are in reasonable range
-        # if embedding.abs().max() > 100.0:
-        #     print(f"[Warning] Embedding has large values despite normalization: "
-        #           f"min={embedding.min():.4f}, max={embedding.max():.4f}, "
-        #           f"mean={embedding.mean():.4f}, std={embedding.std():.4f}")
         
         # Check diffusion schedule parameters
         noise = torch.randn_like(x)
@@ -428,7 +414,7 @@ class Diffusion_TS(GenerativeModel):
         # Compute loss based on training objective (network always predicts x0; we derive epsilon/v as needed)
         if self.training_objective == "x0":
             loss_per_elem = self.recon_loss_fn(x_start_pred, x, reduction="none")
-        elif self.training_objective == "epsilon":
+        elif self.training_objective == "eps":
             pred_noise = self.predict_noise_from_start(x_noisy, t, x_start_pred)
             loss_per_elem = self.recon_loss_fn(pred_noise, noise, reduction="none")
         else:  # v

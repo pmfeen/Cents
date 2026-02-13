@@ -5,7 +5,6 @@ from pathlib import Path
 from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
 from cents.datasets.airquality import AirQualityDataset
-from cents.datasets.vehicle import VehicleDataset
 from cents.trainer import Trainer
 from cents.utils.utils import set_context_config_path, set_context_overrides, get_context_config
 from cents.utils.config_loader import load_yaml, apply_overrides
@@ -92,12 +91,6 @@ def main(args) -> None:
         )
     elif args.dataset == "airquality":
         dataset = AirQualityDataset(
-            cfg=dataset_cfg,
-            force_retrain_normalizer=args.force_retrain_normalizer,
-            run_dir=str(run_dir),
-        )
-    elif args.dataset == "vehicle":
-        dataset = VehicleDataset(
             cfg=dataset_cfg,
             force_retrain_normalizer=args.force_retrain_normalizer,
             run_dir=str(run_dir),

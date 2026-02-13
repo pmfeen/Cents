@@ -22,7 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-DATASET_OVERRIDES = ["max_samples=10000", "skip_heavy_processing=True"]
+DATASET_OVERRIDES = ["max_samples=10000"]
 PECAN_OVERRIDES = ["time_series_dims=1", "user_group=all"]
 
 CONFIG_DATASET_DIR = Path(__file__).resolve().parent.parent / "cents" / "config" / "dataset"
@@ -156,9 +156,9 @@ def main() -> None:
         help="Path to main config YAML file.",
     )
     parser.add_argument(
-        "--no-ema",
+        "--ema",
         action="store_true",
-        help="Disable EMA sampling (EMA is used by default when present in checkpoint).",
+        help="Enable EMA sampling.",
     )
     parser.add_argument(
         "--eval-pv-shift",
@@ -264,7 +264,7 @@ def main() -> None:
             )
 
     # Set EMA sampling
-    cfg.model.use_ema_sampling = not args.no_ema
+    cfg.model.use_ema_sampling = args.ema
 
     # Set evaluation flags (use config defaults if not overridden)
     cfg.eval_pv_shift = args.eval_pv_shift if args.eval_pv_shift else eval_cfg.get("eval_pv_shift", False)

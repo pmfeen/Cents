@@ -775,6 +775,12 @@ class Transformer(nn.Module):
 
         self.time_emb = SinusoidalPosEmb(n_embd)
 
+        self.cond_mix_mlp = nn.Sequential(
+            nn.Linear(n_embd * 2, n_embd),
+            nn.ReLU(),
+            nn.Linear(n_embd, n_embd),
+        )
+
         if conv_params is None or conv_params[0] is None:
             if n_feat < 32 and n_channel < 64:
                 kernel_size, padding = 1, 0
@@ -839,10 +845,13 @@ class Transformer(nn.Module):
         if (cond is not None) and (self.cond_proj is not None):
             label_emb = self.cond_proj(cond) # (B, n_embd)
             # Add them up here to pass a single vector down
-            total_cond_emb = t_emb + label_emb
+            total_cond_emb = torch.concat([t_emb, label_emb], dim=1)
         else:
-            total_cond_emb = t_emb
-        
+            total_cond_emb = torch.concat([t_emb, torch.zeros_like(t_emb)], dim=1)
+
+        ## Use MLP to combine t_emb and label_emb
+        total_cond_emb = self.cond_mix_mlp(total_cond_emb)
+
         emb = self.emb(input)
         inp_enc = self.pos_enc(emb)
 
