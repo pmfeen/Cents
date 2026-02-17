@@ -228,12 +228,21 @@ class Trainer:
 
         checkpoint_dir = getattr(self.cfg, "checkpoint_dir", None) or str(Path(self.cfg.run_dir) / "checkpoints")
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        base_name = "_".join(filename_parts)
+        # Include epoch in filename when saving every N epochs so each checkpoint is distinct
+        every_n = getattr(tc.checkpoint, "every_n_epochs", None)
+        if every_n is not None and every_n > 0:
+            filename = f"{base_name}_epoch={{epoch:04d}}"
+        else:
+            filename = base_name
         callbacks.append(
             ModelCheckpoint(
                 dirpath=checkpoint_dir,
-                filename="_".join(filename_parts),
+                filename=filename,
                 save_last=tc.checkpoint.save_last,
-                save_on_train_epoch_end=True, ### Perhaps excessive
+                save_on_train_epoch_end=True,
+                every_n_epochs=every_n if (every_n is not None and every_n > 0) else None,
+                save_top_k=getattr(tc.checkpoint, "save_top_k", 1),
             )
         )
         callbacks.append(EvalAfterTraining(self.cfg, self.dataset))

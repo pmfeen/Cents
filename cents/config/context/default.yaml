@@ -12,7 +12,7 @@ static_context:
 normalizer:
   stats_head_type: mlp  # Stats head type (e.g., "mlp")
   # Future parameters can be added here:
-  n_layers: 3
+  n_layers: 5
   # hidden_dim: 512
 
 # Dynamic context: context module used by the normalizer for time series context variables

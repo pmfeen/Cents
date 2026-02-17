@@ -121,6 +121,11 @@ class TimeSeriesDataset(Dataset):
         self._save_context_var_codes()
 
 
+        self.context_cfg = get_context_config()
+        self.dynamic_module_type = self.context_cfg.dynamic_context.type 
+        self.static_module_type = self.context_cfg.static_context.type
+        self.stats_head_type = self.context_cfg.normalizer.stats_head_type
+
         is_ddp_subprocess = self._is_ddp_subprocess()
         if self.normalize:
             self._init_normalizer()
@@ -142,12 +147,6 @@ class TimeSeriesDataset(Dataset):
                     print(f"[Main Process] Cached normalized data for subprocesses")
         self.data = self.merge_timeseries_columns(self.data)
         self.data = self.data.reset_index()
-
-        self.context_cfg = get_context_config()
-        self.dynamic_module_type = self.context_cfg.dynamic_context.type 
-        self.static_module_type = self.context_cfg.static_context.type
-        self.stats_head_type = self.context_cfg.normalizer.stats_head_type
-
         
         # Check if we should skip heavy processing for DDP
         if is_ddp_subprocess and skip_heavy_processing:

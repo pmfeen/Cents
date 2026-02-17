@@ -11,9 +11,9 @@ eval_after_training: False
 
 checkpoint:
   save_last: True       # Save final model
-  save_top_k: 3         # Save top 3 best models
+  save_top_k: 0         # 0 = only periodic saves; use >0 to also save top-k by metric
   every_n_train_steps: null
-  every_n_epochs: 20   # Save every 500 epochs
+  every_n_epochs: 250   # Save a distinct checkpoint every 250 epochs (250, 500, 750, ...)
 
 lr_scheduler_params:
   factor: 0.5
