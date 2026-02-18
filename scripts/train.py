@@ -138,7 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--cr_loss_weight", type=float, default=0.1)
     parser.add_argument("--tc_loss_weight", type=float, default=0.1)
     parser.add_argument("--dataset", type=str, default="pecanstreet")
-    parser.add_argument("--epochs", type=int, default=5000)
+    parser.add_argument("--epochs", type=int, default=2500)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--wandb-enabled", action="store_true",
                         help="Enable Weights and Biases logging")

@@ -271,6 +271,9 @@ class AdaLayerNorm(nn.Module):
         # self.emb = SinusoidalPosEmb(n_embd)
         self.silu = nn.SiLU()
         self.linear = nn.Linear(n_embd, n_embd * 2)
+
+        nn.init.zeros_(self.linear.bias)
+        nn.init.zeros_(self.linear.weight)
         self.layernorm = nn.LayerNorm(n_embd, elementwise_affine=False)
 
     def forward(self, x, emb):
@@ -777,7 +780,7 @@ class Transformer(nn.Module):
 
         self.cond_mix_mlp = nn.Sequential(
             nn.Linear(n_embd * 2, n_embd),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(n_embd, n_embd),
         )
 
@@ -845,12 +848,9 @@ class Transformer(nn.Module):
         if (cond is not None) and (self.cond_proj is not None):
             label_emb = self.cond_proj(cond) # (B, n_embd)
             # Add them up here to pass a single vector down
-            total_cond_emb = torch.concat([t_emb, label_emb], dim=1)
+            total_cond_emb = self.cond_mix_mlp(torch.concat([t_emb, label_emb], dim=1))
         else:
-            total_cond_emb = torch.concat([t_emb, torch.zeros_like(t_emb)], dim=1)
-
-        ## Use MLP to combine t_emb and label_emb
-        total_cond_emb = self.cond_mix_mlp(total_cond_emb)
+            total_cond_emb = t_emb
 
         emb = self.emb(input)
         inp_enc = self.pos_enc(emb)
@@ -864,7 +864,6 @@ class Transformer(nn.Module):
 
         res = self.inverse(output)
         
-        # .contiguous() usage here was correct in your original code
         res_m = torch.mean(res, dim=1, keepdim=True).contiguous()
         combine_m_out = self.combine_m(mean).contiguous()
         combine_s_out = self.combine_s(season.transpose(1, 2)).transpose(1, 2).contiguous()

@@ -2,6 +2,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Tuple
+import json
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-DATASET_OVERRIDES = ["max_samples=10000"]
+DATASET_OVERRIDES = ["normalize=False"]
 PECAN_OVERRIDES = ["time_series_dims=1", "user_group=all"]
 
 CONFIG_DATASET_DIR = Path(__file__).resolve().parent.parent / "cents" / "config" / "dataset"
@@ -230,14 +231,14 @@ def main() -> None:
     cfg = OmegaConf.create({})
     cfg.evaluator = eval_cfg
     cfg.wandb = top_cfg.get("wandb", {})
-    cfg.device = "cuda:0"
+    cfg.device = "cuda:2"
     cfg.model = OmegaConf.create(
         OmegaConf.to_container(OmegaConf.load(f"cents/config/model/{model_type}.yaml"), resolve=True)
     )
     cfg.dataset = OmegaConf.create(OmegaConf.to_container(dataset.cfg, resolve=True))
 
-    print("EVAL CONFIG:")
-    print(cfg)
+    # print("EVAL CONFIG:")
+    # print(cfg)
 
     # When loading from a local checkpoint, infer seq_len and time_series_dims from the
     # checkpoint so the model is built with the same architecture (avoids shape mismatch).
@@ -307,10 +308,28 @@ def main() -> None:
     # gen.set_dataset_spec(gen.model.cfg.dataset, dataset.get_context_var_codes())
     cfg.dataset = gen.model.cfg.dataset
     
-    logging.info("Checkpoint loaded. Starting evaluation...")
+    print("\n" + "=" * 60)
+    print("EVALUATION RESULTS")
+    print("=" * 60 + "\n")
     results = Evaluator(cfg, dataset).evaluate_model(data_generator=gen)
-    logging.info("Evaluation complete!")
-    print(results)
+
+    print("\n📊 METRICS:")
+    print("-" * 60)
+    metrics = results.get("metrics", {})
+    for key, value in metrics.items():
+        if isinstance(value, dict):
+            print(f"\n{key}:")
+            for subkey, subval in value.items():
+                print(f"  {subkey}: {subval:.6f}" if isinstance(subval, (int, float)) else f"  {subkey}: {subval}")
+        else:
+            print(f"{key}: {value:.6f}" if isinstance(value, (int, float)) else f"{key}: {value}")
+    
+    # Results are automatically saved if save_results=True
+    if args.save_dir:
+        with open(Path(args.save_dir) / "metrics.json", "w") as f:
+            json.dump(metrics, f, indent=4)
+        print(f"\n✅ Results saved to: {Path(args.save_dir) / "metrics.json"}")
+    print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":

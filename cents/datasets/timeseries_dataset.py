@@ -104,8 +104,8 @@ class TimeSeriesDataset(Dataset):
         # Store categorical time series info
         self.categorical_time_series = categorical_time_series or {}
 
-        if self.scale:
-            assert self.normalize, "Normalization must be enabled if scaling is enabled"
+        # if self.scale:
+        #     assert self.normalize, "Normalization must be enabled if scaling is enabled"
 
         # Preprocess and optionally encode context
         self.data = self._preprocess_data(data)
@@ -120,6 +120,11 @@ class TimeSeriesDataset(Dataset):
             self.data, self.context_var_codes = self._encode_context_vars(self.data)
         self._save_context_var_codes()
 
+
+        self.context_cfg = get_context_config()
+        self.dynamic_module_type = self.context_cfg.dynamic_context.type 
+        self.static_module_type = self.context_cfg.static_context.type
+        self.stats_head_type = self.context_cfg.normalizer.stats_head_type
 
         is_ddp_subprocess = self._is_ddp_subprocess()
         if self.normalize:
@@ -142,7 +147,6 @@ class TimeSeriesDataset(Dataset):
                     print(f"[Main Process] Cached normalized data for subprocesses")
         self.data = self.merge_timeseries_columns(self.data)
         self.data = self.data.reset_index()
-
         
         # Check if we should skip heavy processing for DDP
         if is_ddp_subprocess and skip_heavy_processing:
@@ -671,11 +675,6 @@ class TimeSeriesDataset(Dataset):
         normalizer_dir.mkdir(parents=True, exist_ok=True)
         
         # Get context_module_type and stats_head_type from context config
-        context_cfg = get_context_config()
-
-        self.dynamic_module_type = context_cfg.dynamic_context.type 
-        self.static_module_type = context_cfg.static_context.type
-        self.stats_head_type = context_cfg.normalizer.stats_head_type
         cache_path = normalizer_dir / _ckpt_name(
             self.name, 
             "normalizer", 
@@ -692,6 +691,7 @@ class TimeSeriesDataset(Dataset):
             dataset_cfg=self.cfg,
             normalizer_training_cfg=ncfg,
             dataset=self,
+            context_cfg=self.context_cfg,
         )
 
         # attempt to load existing state dict (unless force_retrain_normalizer is True)

@@ -196,49 +196,68 @@ class Trainer:
     def _instantiate_trainer(self) -> pl.Trainer:
         """
         Build a PyTorch Lightning Trainer with ModelCheckpoint and loggers.
-
-        Returns:
-            Configured pl.Trainer instance.
+        Saves checkpoints every N epochs (if configured) and always keeps last.ckpt.
         """
         tc = self.cfg.trainer
         callbacks = []
-        # Build filename with optional context_module_type
+
+        # ---- Build descriptive base filename ----
         filename_parts = [
             self.cfg.dataset.name,
             self.model_type,
-            f"dim{self.cfg.dataset.time_series_dims}"
+            f"dim{self.cfg.dataset.time_series_dims}",
         ]
-        
-        # Add context_module_type from context config
+
         from cents.utils.utils import get_context_config
         context_cfg = get_context_config()
-        static_context_module_type = context_cfg.static_context.type
-        if static_context_module_type:
-            filename_parts.append(f"ctx{static_context_module_type}")
 
-        dynamic_context_module_type = context_cfg.dynamic_context.type
-        if dynamic_context_module_type:
-            filename_parts.append(f"dyn{dynamic_context_module_type}")
-        
-        # Add stats_head_type from context config
-        stats_head_type = context_cfg.normalizer.stats_head_type
-        if stats_head_type:
-            filename_parts.append(f"stats{stats_head_type}")
-        
+        if context_cfg.static_context.type:
+            filename_parts.append(f"ctx{context_cfg.static_context.type}")
 
-        checkpoint_dir = getattr(self.cfg, "checkpoint_dir", None) or str(Path(self.cfg.run_dir) / "checkpoints")
-        Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+        if context_cfg.dynamic_context.type:
+            filename_parts.append(f"dyn{context_cfg.dynamic_context.type}")
+
+        if context_cfg.normalizer.stats_head_type:
+            filename_parts.append(f"stats{context_cfg.normalizer.stats_head_type}")
+
+        base_name = "_".join(filename_parts)
+
+        # ---- Checkpoint directory ----
+        checkpoint_dir = (Path(self.cfg.run_dir) / "checkpoints")
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # ---- Periodic saving config ----
+        every_n = getattr(tc.checkpoint, "every_n_epochs", None)
+
+        if every_n and every_n > 0:
+            filename = f"{base_name}_epoch={{epoch:04d}}"
+            every_n_epochs = every_n
+            save_top_k = -1  # keep ALL periodic checkpoints
+        else:
+            filename = base_name
+            every_n_epochs = None
+            save_top_k = getattr(tc.checkpoint, "save_top_k", 1)
+
+        print(f"Saving every {every_n_epochs} epochs (if configured)")
+
         callbacks.append(
             ModelCheckpoint(
                 dirpath=checkpoint_dir,
-                filename="_".join(filename_parts),
-                save_last=tc.checkpoint.save_last,
-                save_on_train_epoch_end=True, ### Perhaps excessive
+                filename=filename,
+                every_n_epochs=every_n_epochs,
+                save_on_train_epoch_end=True,
+                save_last=True,          # always keep last.ckpt
+                save_top_k=save_top_k,
+                auto_insert_metric_name=False,
             )
         )
+
         callbacks.append(EvalAfterTraining(self.cfg, self.dataset))
+
         if getattr(self.cfg, "run_dir", None):
             callbacks.append(LogLossToCsv(self.cfg.run_dir))
+
+        # ---- Logger ----
         logger = False
         if getattr(self.cfg, "wandb", None) and self.cfg.wandb.enabled:
             logger = WandbLogger(
@@ -260,6 +279,7 @@ class Trainer:
             logger=logger,
             default_root_dir=self.cfg.run_dir,
         )
+
 
 
 class LogLossToCsv(Callback):
