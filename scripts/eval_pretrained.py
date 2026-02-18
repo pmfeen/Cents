@@ -23,7 +23,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-DATASET_OVERRIDES = ["max_samples=10000", "normalize=False"]
+DATASET_OVERRIDES = ["normalize=False"]
 PECAN_OVERRIDES = ["time_series_dims=1", "user_group=all"]
 
 CONFIG_DATASET_DIR = Path(__file__).resolve().parent.parent / "cents" / "config" / "dataset"
@@ -231,7 +231,7 @@ def main() -> None:
     cfg = OmegaConf.create({})
     cfg.evaluator = eval_cfg
     cfg.wandb = top_cfg.get("wandb", {})
-    cfg.device = "cuda:1"
+    cfg.device = "cuda:2"
     cfg.model = OmegaConf.create(
         OmegaConf.to_container(OmegaConf.load(f"cents/config/model/{model_type}.yaml"), resolve=True)
     )

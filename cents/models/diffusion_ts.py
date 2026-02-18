@@ -31,7 +31,9 @@ class Diffusion_TS(GenerativeModel):
 
     Uses a Transformer backbone to predict and denoise time series over
     discrete diffusion timesteps. Supports EMA smoothing and configurable
-    beta schedules.
+    beta schedules. Optional reconstruction-guided sampling (Algorithms 1 & 2)
+    via sample_reconstruction_guided(shape, context_vars, x_a, algorithm="alg1"|"alg2")
+    when conditional observed data x_a is provided.
 
     Training objective (config model.training_objective): x0, epsilon, or v.
       - x0: predict clean sample; loss = L1/L2(model_out, x_clean).
@@ -67,14 +69,33 @@ class Diffusion_TS(GenerativeModel):
         self.context_reconstruction_loss_weight = (
             cfg.model.context_reconstruction_loss_weight
         )
+        # Reconstruction-guided sampling (Algorithms 1 & 2)
+        self.recon_guide_eta = getattr(cfg.model, "recon_guide_eta", 0.1)
+        self.recon_guide_gamma = getattr(cfg.model, "recon_guide_gamma", 1.0)
+        self.recon_guide_algorithm = getattr(cfg.model, "recon_guide_algorithm", "none")
+        self.recon_guide_K = getattr(cfg.model, "recon_guide_K", 3)
         # Verify context modules are initialized (static, dynamic, or both)
         if not hasattr(self, 'static_context_module') and not hasattr(self, 'dynamic_context_module'):
             raise ValueError("At least one context module (static or dynamic) must be initialized")
 
-        # linear layer for denoised output (no longer includes embedding_dim)
-        self.fc = nn.Linear(
-            self.time_series_dims, self.time_series_dims
-        )
+        # Context embedding dropout (training only) for robust reconstruction-guided sampling
+        context_embed_dropout = getattr(cfg.model, "context_embed_dropout", 0.0)
+        self.context_embed_dropout = nn.Dropout(p=context_embed_dropout)
+
+        # Optional dual head for x̂_a / x̂_b: separate output heads for conditional vs rest of sequence
+        self.recon_cond_len = getattr(cfg.model, "recon_cond_len", None)
+        if self.recon_cond_len is not None:
+            cond_len = int(self.recon_cond_len)
+            assert 0 < cond_len < self.seq_len, "recon_cond_len must be in (0, seq_len)"
+            self.fc_a = nn.Linear(self.time_series_dims, self.time_series_dims)
+            self.fc_b = nn.Linear(self.time_series_dims, self.time_series_dims)
+            self.fc = None
+        else:
+            self.fc_a = None
+            self.fc_b = None
+            self.fc = nn.Linear(
+                self.time_series_dims, self.time_series_dims
+            )
         # Transformer backbone (now uses AdaLN conditioning instead of input concatenation)
         self.model = Transformer(
             n_feat=self.time_series_dims,
@@ -239,8 +260,23 @@ class Diffusion_TS(GenerativeModel):
         elif len(embeddings) == 1:
             embedding = embeddings[0]
         else:
-            raise ValueError("No context variables provided")        
+            raise ValueError("No context variables provided")
+        if self.training and self.context_embed_dropout.p > 0:
+            embedding = self.context_embed_dropout(embedding)
         return embedding, all_logits
+
+    def _decode_to_x0(self, backbone: torch.Tensor) -> torch.Tensor:
+        """
+        Map backbone output (trend+season) to x0 prediction. Uses single fc or dual fc_a/fc_b when recon_cond_len is set.
+        backbone: (B, L, time_series_dims).
+        """
+        if self.fc is not None:
+            return self.fc(backbone)
+        cond_len = self.recon_cond_len
+        return torch.cat([
+            self.fc_a(backbone[:, :cond_len]),
+            self.fc_b(backbone[:, cond_len:]),
+        ], dim=1)
 
     def predict_noise_from_start(
         self, x_t: torch.Tensor, t: torch.Tensor, x0: torch.Tensor
@@ -410,7 +446,7 @@ class Diffusion_TS(GenerativeModel):
         )
         # Pass embedding as cond parameter instead of concatenating to input
         trend, season = self.model(x_noisy, t, padding_masks=None, cond=embedding)
-        x_start_pred = self.fc((trend + season).contiguous())
+        x_start_pred = self._decode_to_x0((trend + season).contiguous())
         # Compute loss based on training objective (network always predicts x0; we derive epsilon/v as needed)
         if self.training_objective == "x0":
             loss_per_elem = self.recon_loss_fn(x_start_pred, x, reduction="none")
@@ -431,7 +467,31 @@ class Diffusion_TS(GenerativeModel):
         rec_loss = (
             self.loss_weight[t].view(-1, 1, 1) * loss_per_elem
         ).mean()
-        return rec_loss, cond_classification_logits
+
+        fourier_loss = torch.tensor(0.0, device=self.device)
+        if self.use_ff:
+            # FFT is not generally supported in fp16 for non power-of-2 sizes on cuFFT.
+            # Run FFT in fp32 outside autocast.
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                x1 = x_start_pred.transpose(1, 2).float()
+                x2 = x.transpose(1, 2).float()
+
+                fft1 = torch.fft.fft(x1, norm="forward")
+                fft2 = torch.fft.fft(x2, norm="forward")
+
+            # (optional) keep loss in fp32 for stability; no need to cast back to fp16
+            fft1 = fft1.transpose(1, 2)
+            fft2 = fft2.transpose(1, 2)
+
+            fourier_loss = (
+                self.recon_loss_fn(fft1.real, fft2.real, reduction="none")
+                + self.recon_loss_fn(fft1.imag, fft2.imag, reduction="none")
+            )
+            fourier_loss = (
+                self.loss_weight[t].view(-1, 1, 1) * fourier_loss
+            ).mean()
+
+        return rec_loss, cond_classification_logits, fourier_loss.mean()
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
         """
@@ -445,7 +505,7 @@ class Diffusion_TS(GenerativeModel):
             total_loss: Scalar training loss.
         """
         ts_batch, cond_batch = batch
-        rec_loss, cond_class_logits = self(ts_batch, cond_batch)
+        rec_loss, cond_class_logits, fourier_loss = self(ts_batch, cond_batch)
         
         cond_loss = 0.0
 
@@ -475,7 +535,7 @@ class Diffusion_TS(GenerativeModel):
         )
 
         total_loss = (
-            rec_loss + self.context_reconstruction_loss_weight * cond_loss + tc_term
+            rec_loss + self.context_reconstruction_loss_weight * cond_loss + tc_term + fourier_loss * self.ff_weight
         )
         
         # Check for NaN in total loss
@@ -491,6 +551,7 @@ class Diffusion_TS(GenerativeModel):
                 "rec_loss": rec_loss.item(),
                 "cond_loss": cond_loss.item(),
                 "tc_loss": tc_term,
+                "fourier_loss": fourier_loss.item(),
             },
             prog_bar=True,
             sync_dist=True,
@@ -582,6 +643,17 @@ class Diffusion_TS(GenerativeModel):
     #     else:
     #         raise ValueError("No EMA keys found in checkpoint")
 
+    def _predict_x0_from_xt_with_grad(
+        self, x_t: torch.Tensor, t: torch.Tensor, embedding: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Predict x0 from x_t with gradients enabled (for reconstruction-guided sampling).
+        Returns x_start of shape (B, L, C). Call with x_t.requires_grad_(True).
+        """
+        trend, season = self.model(x_t, t, padding_masks=None, cond=embedding)
+        x_start = self._decode_to_x0((trend + season).contiguous())
+        return x_start
+
     @torch.no_grad()
     def model_predictions(
         self, x: torch.Tensor, t: torch.Tensor, embedding: torch.Tensor
@@ -594,9 +666,21 @@ class Diffusion_TS(GenerativeModel):
             x_start: predicted clean sample tensor.
         """
         trend, season = self.model(x, t, padding_masks=None, cond=embedding)
-        x_start = self.fc((trend + season).contiguous())
+        x_start = self._decode_to_x0((trend + season).contiguous())
         pred_noise = self.predict_noise_from_start(x, t, x_start)
         return pred_noise, x_start
+
+    @staticmethod
+    def _replace_conditional(
+        x_a: torch.Tensor, x_prev: torch.Tensor, cond_len: int
+    ) -> torch.Tensor:
+        """
+        Replace the first cond_len time steps of x_prev with conditional data x_a.
+        x_a: (B, cond_len, C), x_prev: (B, L, C). Returns (B, L, C).
+        """
+        out = x_prev.clone()
+        out[:, :cond_len] = x_a
+        return out
 
     @torch.no_grad()
     def p_mean_variance(
@@ -623,6 +707,142 @@ class Diffusion_TS(GenerativeModel):
         pm, pv, plv, _ = self.p_mean_variance(x, bt, embedding)
         noise = torch.randn_like(x) if t > 0 else 0
         return pm + (0.5 * plv).exp() * noise
+
+    def _reconstruction_guided_step_alg1(
+        self,
+        x_t: torch.Tensor,
+        t: int,
+        embedding: torch.Tensor,
+        x_a: torch.Tensor,
+        cond_len: int,
+        eta: float,
+        gamma: float,
+    ) -> torch.Tensor:
+        """
+        One step of Algorithm 1: predict x̂_0, compute L_1 + γ*L_2, then
+        x̃_0 = x̂_0 + η ∇_{x_t}(L_1 + γ*L_2); sample x_{t-1} ~ N(μ(x̃_0, x_t), Σ) and Replace(x_a, x_{t-1}).
+        """
+        bt = torch.full((x_t.shape[0],), t, device=self.device, dtype=torch.long)
+        x_t = x_t.detach().requires_grad_(True)
+
+        x_start = self._predict_x0_from_xt_with_grad(x_t, bt, embedding)
+        x_hat_a = x_start[:, :cond_len]
+        L_1 = (x_a - x_hat_a).pow(2).mean()
+
+        pm, pv, plv = self.q_posterior(x_start, x_t, bt)
+        noise = torch.randn_like(x_t, device=x_t.device) if t > 0 else torch.zeros_like(x_t, device=x_t.device)
+        x_prev_initial = (pm + (0.5 * plv).exp() * noise).detach()
+        L_2 = ((x_prev_initial - pm).pow(2) / pv.clamp(min=1e-8)).mean()
+
+        loss = L_1 + gamma * L_2
+        loss.backward()
+        with torch.no_grad():
+            # x̃_0 = x̂_0 + η ∇_{x_t}(L_1 + γ*L_2); gradient has same shape as x_t (B,L,C) = x̂_0
+            x_tilde_0 = x_start.detach() + eta * x_t.grad
+            pm_final, pv_final, plv_final = self.q_posterior(x_tilde_0, x_t.detach(), bt)
+            noise_final = torch.randn_like(x_t, device=x_t.device) if t > 0 else torch.zeros_like(x_t, device=x_t.device)
+            x_prev = pm_final + (0.5 * plv_final).exp() * noise_final
+            x_prev = self._replace_conditional(x_a, x_prev, cond_len)
+        return x_prev
+
+    def _reconstruction_guided_step_alg2(
+        self,
+        x_t: torch.Tensor,
+        t: int,
+        embedding: torch.Tensor,
+        x_a: torch.Tensor,
+        cond_len: int,
+        eta: float,
+        gamma: float,
+        K: int,
+    ) -> torch.Tensor:
+        """
+        One step of Algorithm 2: K inner gradient updates on x_t, then one final sample and Replace.
+        """
+        bt = torch.full((x_t.shape[0],), t, device=self.device, dtype=torch.long)
+        embedding_detach = embedding.detach()
+        x_t = x_t.detach().clone()
+
+        for _ in range(K):
+            x_t = x_t.requires_grad_(True)
+            x_start = self._predict_x0_from_xt_with_grad(x_t, bt, embedding_detach)
+            x_hat_a = x_start[:, :cond_len]
+            L_1 = (x_a - x_hat_a).pow(2).mean()
+
+            pm, pv, plv = self.q_posterior(x_start, x_t, bt)
+            noise = torch.randn_like(x_t, device=x_t.device) if t > 0 else torch.zeros_like(x_t, device=x_t.device)
+            x_prev_initial = (pm + (0.5 * plv).exp() * noise).detach()
+            L_2 = ((x_prev_initial - pm).pow(2) / pv.clamp(min=1e-8)).mean()
+
+            loss = L_1 + gamma * L_2
+            loss.backward()
+            with torch.no_grad():
+                x_t = x_t + eta * x_t.grad
+                x_t = x_t.detach()
+
+        with torch.no_grad():
+            x_start_final = self._predict_x0_from_xt_with_grad(x_t, bt, embedding_detach)
+            pm_final, pv_final, plv_final = self.q_posterior(x_start_final, x_t, bt)
+            noise_final = torch.randn_like(x_t, device=x_t.device) if t > 0 else torch.zeros_like(x_t, device=x_t.device)
+            x_prev = pm_final + (0.5 * plv_final).exp() * noise_final
+            x_prev = self._replace_conditional(x_a, x_prev, cond_len)
+        return x_prev
+
+    def sample_reconstruction_guided(
+        self,
+        shape: Tuple[int, int, int],
+        context_vars: dict,
+        x_a: torch.Tensor,
+        algorithm: str = "alg1",
+    ) -> torch.Tensor:
+        """
+        Full reverse-pass sampling with reconstruction guidance (Algorithm 1 or 2).
+
+        Args:
+            shape: (batch_size, seq_len, time_series_dims).
+            context_vars: context conditioning dict.
+            x_a: Conditional (observed) data, shape (B, cond_len, C). First cond_len
+                 time steps to reconstruct; model output is split as x̂_0 = [x̂_a, x̂_b].
+            algorithm: "alg1" (one gradient step per t) or "alg2" (K inner steps per t).
+
+        Returns:
+            Generated samples (B, L, C) with first cond_len steps equal to x_a.
+
+        Architecture / config notes (optional improvements):
+        - x̂_0 split: Currently x̂_0 is the single model output (B,L,C); we split by time
+          so x̂_a = x̂_0[:, :cond_len], x̂_b = x̂_0[:, cond_len:]. Optionally use two output
+          heads (one for x̂_a, one for x̂_b) if you want different capacities.
+        - Context dropout: Consider adding dropout on the context embedding (or on
+          context encoder outputs) during training to improve robustness of
+          reconstruction-guided sampling at test time.
+        - Config: recon_guide_eta (gradient scale), recon_guide_gamma (L1 vs L2 trade-off),
+          recon_guide_K (int or list of length num_timesteps for per-t inner steps in alg2).
+        """
+        cond_len = x_a.shape[1]
+        assert cond_len < shape[1], "x_a length must be < seq_len"
+        assert x_a.shape[0] == shape[0] and x_a.shape[2] == shape[2]
+        eta = self.recon_guide_eta
+        gamma = self.recon_guide_gamma
+
+        x = torch.randn(shape, device=self.device)
+        embedding, _ = self._get_context_embedding(context_vars)
+        x_a = x_a.to(self.device)
+
+        for t in reversed(range(self.num_timesteps)):
+            K_t = (
+                self.recon_guide_K[t] if t < len(self.recon_guide_K) else self.recon_guide_K[-1]
+                if isinstance(self.recon_guide_K, (list, tuple))
+                else self.recon_guide_K
+            )
+            if algorithm == "alg1":
+                x = self._reconstruction_guided_step_alg1(
+                    x, t, embedding, x_a, cond_len, eta, gamma
+                )
+            else:
+                x = self._reconstruction_guided_step_alg2(
+                    x, t, embedding, x_a, cond_len, eta, gamma, K_t
+                )
+        return x
 
     @torch.no_grad()
     def sample(self, shape: Tuple[int, int, int], context_vars: dict) -> torch.Tensor:

@@ -29,3 +29,12 @@ ema_decay: 0.99
 ema_update_interval: 10
 use_ema_sampling: False
 k_bins: 20
+# Reconstruction-guided sampling (Algorithms 1 & 2)
+recon_guide_eta: 0.1        # gradient scale for guidance
+recon_guide_gamma: 1.0      # trade-off L1 vs L2 (L1 + gamma*L2)
+recon_guide_algorithm: none # none | alg1 | alg2
+recon_guide_K: 3            # inner steps per t for alg2 (int or list for K[t])
+# Optional: dual head for x̂_a / x̂_b (set to cond_len used in recon-guided sampling)
+recon_cond_len: null        # int or null; if set, use fc_a / fc_b for first vs rest of sequence
+# Context embedding dropout (training only) for more robust recon-guided sampling
+context_embed_dropout: 0  # 0 = disabled
