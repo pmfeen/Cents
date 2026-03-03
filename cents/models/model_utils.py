@@ -9,12 +9,31 @@ Note: Please ensure compliance with the repository's license and credit the orig
 """
 
 import math
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange, reduce, repeat
 from torch import nn
+
+
+def _nan_check(t: Optional[torch.Tensor], name: str, extra: str = "") -> None:
+    """Print location and stats when tensor contains NaN or Inf (for debugging)."""
+    if t is None or not isinstance(t, torch.Tensor):
+        return
+    if not (torch.isnan(t).any() or torch.isinf(t).any()):
+        return
+    nan_c = torch.isnan(t).sum().item()
+    inf_c = torch.isinf(t).sum().item()
+    finite = t[~(torch.isnan(t) | torch.isinf(t))]
+    min_s = finite.min().item() if finite.numel() > 0 else float("nan")
+    max_s = finite.max().item() if finite.numel() > 0 else float("nan")
+    mean_s = finite.float().mean().item() if finite.numel() > 0 else float("nan")
+    print(
+        f"[NaN/Inf] Transformer {name}: shape={tuple(t.shape)}, nan_count={nan_c}, inf_count={inf_c}, "
+        f"finite_min={min_s:.6g}, finite_max={max_s:.6g}, finite_mean={mean_s:.6g} {extra}".strip()
+    )
 
 
 def linear_beta_schedule(timesteps: int) -> torch.Tensor:
@@ -51,6 +70,23 @@ def cosine_beta_schedule(timesteps: int, s: float = 0.004) -> torch.Tensor:
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+import math
+import torch
+
+
+def cosine_beta_schedule_logsnr(
+    timesteps: int,
+    logsnr_min: float = -8.0,
+    logsnr_max: float = 15.0,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    t = torch.linspace(0, 1, timesteps + 1, dtype=torch.float32)
+    logsnr = logsnr_max + 0.5 * (logsnr_min - logsnr_max) * (1 - torch.cos(math.pi * t))
+
+    alpha_bar = torch.sigmoid(logsnr).clamp(eps, 1.0 - eps)
+
+    betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
+    return torch.clip(betas, 0, 0.999)
 
 def exists(x):
     return x is not None
@@ -219,10 +255,21 @@ class Conv_MLP(nn.Module):
 
     def forward(self, x):
         # x: (B, T, C)
+        _nan_check(x, "Conv_MLP forward x (initial)")
+        # # Print when values are extreme (even if not NaN) to debug downstream NaN
+        # print(
+        #     f"[Conv_MLP] x (initial): shape={tuple(x.shape)}, min={x.min().item():.6g}, max={x.max().item():.6g}, "
+        #     f"abs_max={x.abs().max().item():.6g}, has_nan={torch.isnan(x).any().item()}, has_inf={torch.isinf(x).any().item()}"
+        # )
         x = x.transpose(1, 2).contiguous()   # (B, C, T) contiguous
+        _nan_check(x, "Conv_MLP forward x (transposed)")
         x = self.conv(x)
+        _nan_check(x, "Conv_MLP forward x (conv)")
         x = self.drop(x)
-        return x.transpose(1, 2).contiguous()  # back to (B, T, C), contiguous
+        _nan_check(x, "Conv_MLP forward x (drop)")
+        out = x.transpose(1, 2).contiguous()  # back to (B, T, C), contiguous
+        _nan_check(out, "Conv_MLP forward out (transposed)")
+        return out
 
 
 
@@ -633,7 +680,7 @@ class DecoderBlock(nn.Module):
         super().__init__()
 
         self.ln1 = AdaLayerNorm(n_embd)
-        self.ln2 = AdaLayerNorm(n_embd)  # Changed from nn.LayerNorm to AdaLayerNorm
+        self.ln2 = AdaLayerNorm(n_embd)
 
         self.attn1 = FullAttention(
             n_embd=n_embd,
@@ -642,6 +689,17 @@ class DecoderBlock(nn.Module):
             resid_pdrop=resid_pdrop,
         )
         self.attn2 = CrossAttention(
+            n_embd=n_embd,
+            condition_embd=condition_dim,
+            n_head=n_head,
+            attn_pdrop=attn_pdrop,
+            resid_pdrop=resid_pdrop,
+        )
+        # Cross-attention for temporally-aligned dynamic context (same seq_len as target).
+        # Conditioned via AdaLN on the same diffusion-timestep + static-context embedding
+        # as the rest of the block, so global conditioning still flows through here.
+        self.ln_dyn = AdaLayerNorm(n_embd)
+        self.attn_dyn = CrossAttention(
             n_embd=n_embd,
             condition_embd=condition_dim,
             n_head=n_head,
@@ -669,11 +727,14 @@ class DecoderBlock(nn.Module):
         self.proj = nn.Conv1d(n_channel, n_channel * 2, 1)
         self.linear = nn.Linear(n_embd, n_feat)
 
-    def forward(self, x, encoder_output, cond_emb, mask=None):        
+    def forward(self, x, encoder_output, cond_emb, dyn_ctx=None, mask=None):
         a, att = self.attn1(self.ln1(x, cond_emb), mask=mask)
         x = x + a
         a, att = self.attn2(self.ln1_1(x, cond_emb), encoder_output, mask=mask)
         x = x + a
+        if dyn_ctx is not None:
+            a, _ = self.attn_dyn(self.ln_dyn(x, cond_emb), dyn_ctx)
+            x = x + a
         
         # FIX: chunk() returns views that are often non-contiguous. 
         # Since self.proj and self.trend use Conv1d, this causes the DDP stride mismatch.
@@ -725,19 +786,18 @@ class Decoder(nn.Module):
             ]
         )
 
-    def forward(self, x, cond_emb, enc, padding_masks=None):
+    def forward(self, x, cond_emb, enc, dyn_ctx=None, padding_masks=None):
         b, c, _ = x.shape
         mean = []
         # Initialize accumulating tensors on the correct device
-        season = torch.zeros((b, c, x.shape[-1]), device=x.device) 
-        # Note: Check if season dim is n_embd or n_feat. 
-        # FourierLayer returns same dim as input x (n_embd)
-        
+        season = torch.zeros((b, c, x.shape[-1]), device=x.device)
+        # Note: FourierLayer returns same dim as input x (n_embd)
+
         trend = torch.zeros((b, c, self.blocks[0].linear.out_features), device=x.device)
-        
+
         for block in self.blocks:
             x, residual_mean, residual_trend, residual_season = block(
-                x, enc, cond_emb, mask=padding_masks
+                x, enc, cond_emb, dyn_ctx=dyn_ctx, mask=padding_masks
             )
             season += residual_season
             trend += residual_trend
@@ -771,10 +831,13 @@ class Transformer(nn.Module):
         
         self.cond_dim = cond_dim
         if cond_dim is not None:
-            # Map context embedding (B, cond_dim) -> (B, n_embd)
+            # Map static context embedding (B, cond_dim) -> (B, n_embd)
             self.cond_proj = nn.Linear(cond_dim, n_embd)
+            # Map dynamic context sequence (B, T, cond_dim) -> (B, T, n_embd)
+            self.dyn_ctx_proj = nn.Linear(cond_dim, n_embd)
         else:
             self.cond_proj = None
+            self.dyn_ctx_proj = None
 
         self.time_emb = SinusoidalPosEmb(n_embd)
 
@@ -840,38 +903,71 @@ class Transformer(nn.Module):
             n_embd, dropout=resid_pdrop, max_len=max_len
         )
 
-    def forward(self, input, t, padding_masks=None, return_res=False, cond=None):
-        # cond: (B, cond_dim) or None
+    def forward(self, input, t, padding_masks=None, return_res=False, cond=None, dyn_ctx=None):
+        # cond: (B, cond_dim) static context or None
+        # dyn_ctx: (B, T, cond_dim) dynamic context sequence or None
+        # Ensure float32 so conv/linear (float32 params) never see double input
+        if input.is_floating_point():
+            input = input.float()
+        if cond is not None and cond.is_floating_point():
+            cond = cond.float()
+        if dyn_ctx is not None and dyn_ctx.is_floating_point():
+            dyn_ctx = dyn_ctx.float()
+        _nan_check(input, "forward input")
         t_emb = self.time_emb(t)
+        _nan_check(t_emb, "forward t_emb")
 
         label_emb = None
         if (cond is not None) and (self.cond_proj is not None):
-            label_emb = self.cond_proj(cond) # (B, n_embd)
-            # Add them up here to pass a single vector down
+            label_emb = self.cond_proj(cond)  # (B, n_embd)
+            _nan_check(label_emb, "forward label_emb")
             total_cond_emb = self.cond_mix_mlp(torch.concat([t_emb, label_emb], dim=1))
         else:
             total_cond_emb = t_emb
+        _nan_check(total_cond_emb, "forward total_cond_emb")
+
+        # Project dynamic context sequence to n_embd for cross-attention
+        dyn_ctx_emb = None
+        if dyn_ctx is not None and self.dyn_ctx_proj is not None:
+            dyn_ctx_emb = self.dyn_ctx_proj(dyn_ctx)  # (B, T, n_embd)
+            _nan_check(dyn_ctx_emb, "forward dyn_ctx_emb")
 
         emb = self.emb(input)
+        _nan_check(emb, "forward emb")
         inp_enc = self.pos_enc(emb)
+        _nan_check(inp_enc, "forward inp_enc")
 
         enc_cond = self.encoder(inp_enc, total_cond_emb, padding_masks=padding_masks)
+        _nan_check(enc_cond, "forward enc_cond")
 
         inp_dec = self.pos_dec(emb)
+        _nan_check(inp_dec, "forward inp_dec")
         output, mean, trend, season = self.decoder(
-            inp_dec, total_cond_emb, enc_cond, padding_masks=padding_masks
+            inp_dec, total_cond_emb, enc_cond, dyn_ctx=dyn_ctx_emb, padding_masks=padding_masks
         )
+        _nan_check(output, "forward decoder output")
+        _nan_check(mean, "forward decoder mean")
+        _nan_check(trend, "forward decoder trend")
+        _nan_check(season, "forward decoder season")
 
         res = self.inverse(output)
-        
+        _nan_check(res, "forward res (inverse output)")
+
         res_m = torch.mean(res, dim=1, keepdim=True).contiguous()
+        _nan_check(res_m, "forward res_m")
         combine_m_out = self.combine_m(mean).contiguous()
+        _nan_check(combine_m_out, "forward combine_m_out")
         combine_s_out = self.combine_s(season.transpose(1, 2)).transpose(1, 2).contiguous()
+        _nan_check(combine_s_out, "forward combine_s_out")
         season_error = (combine_s_out + res - res_m).contiguous()
+        _nan_check(season_error, "forward season_error")
         trend = (combine_m_out + res_m + trend).contiguous()
+        _nan_check(trend, "forward trend (final)")
 
         if return_res:
-            return trend, combine_s_out, res - res_m
+            out_res = res - res_m
+            _nan_check(out_res, "forward return res - res_m")
+            return trend, combine_s_out, out_res
 
         return trend, season_error
 

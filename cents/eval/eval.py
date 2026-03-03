@@ -187,19 +187,23 @@ class Evaluator:
         syn_data: np.ndarray,
         real_data_frame: pd.DataFrame,
         mask: Optional[np.ndarray] = None,
+        target: Optional[Dict] = None,
+        log_prefix: str = "",
     ) -> Dict:
         """
-        Compute evaluation metrics and store them in current_results.
+        Compute evaluation metrics and store them in current_results (or in target if provided).
 
         Args:
             real_data (np.ndarray): Real data array (shape: [N, seq_len, dims])
             syn_data (np.ndarray): Synthetic data array (shape: [N, seq_len, dims])
             real_data_frame (pd.DataFrame): Real data subset (inverse-transformed)
             mask (Optional[np.ndarray]): Boolean array indicating which rows are "rare"
+            target (Optional[Dict]): If set, write metrics into this dict instead of current_results (for normalized_domain).
+            log_prefix (str): Prefix for log messages (e.g. "[normalized]").
         """
-        logger.info(f"[Cents] --- Starting Full-Subset Metrics ---")
+        logger.info(f"[Cents] --- {log_prefix}Full-Subset Metrics ---")
 
-        metrics = {}
+        metrics = target if target is not None else {}
 
         # Compute and store metrics
         dtw_mean, dtw_std = dynamic_time_warping_dist(real_data, syn_data)
@@ -269,7 +273,9 @@ class Evaluator:
             logger.info("[Cents] Done computing Rare-Subset Metrics.")
             metrics["rare_subset"] = rare_metrics
 
-        self.current_results["metrics"] = metrics
+        if target is None:
+            self.current_results["metrics"] = metrics
+        return metrics
 
     def compute_disentanglement_metrics(
         self,
@@ -352,13 +358,24 @@ class Evaluator:
         dataset.data = dataset.get_combined_rarity()
         real_data_subset = dataset.data.iloc[indices].reset_index(drop=True)
         continuous_vars = getattr(dataset, "continuous_vars", [])
-        context_vars = {}
-        for name in dataset.context_vars:
+        static_context_vars = {}
+        for name in dataset.static_context_vars:
             vals = real_data_subset[name].values
             dtype = torch.float32 if name in continuous_vars else torch.long
-            context_vars[name] = torch.tensor(vals, dtype=dtype, device=self.device)
+            static_context_vars[name] = torch.tensor(vals, dtype=dtype, device=self.device)
+        dynamic_context_vars = {}
+        categorical_ts = getattr(dataset, "categorical_time_series", {})
+        for name in dataset.dynamic_context_vars:
+            vals = real_data_subset[name].values
+            # Dynamic module expects tensors (training path uses torch.from_numpy in dataset __getitem__)
+            if len(vals) and hasattr(vals[0], "__len__") and not isinstance(vals[0], (str, bytes)):
+                arr = np.stack([np.asarray(v, dtype=np.float32 if name not in categorical_ts else np.int64) for v in vals])
+            else:
+                arr = np.asarray(vals, dtype=np.float32 if name not in categorical_ts else np.int64)
+            dtype = torch.long if name in categorical_ts else torch.float32
+            dynamic_context_vars[name] = torch.tensor(arr, dtype=dtype, device=self.device)
 
-        generated_ts = model.generate(context_vars).cpu().numpy()
+        generated_ts = model.generate(static_context_vars, dynamic_context_vars).cpu().numpy()
         if generated_ts.ndim == 2:
             generated_ts = generated_ts.reshape(
                 generated_ts.shape[0], -1, generated_ts.shape[1]
@@ -367,8 +384,19 @@ class Evaluator:
         syn_data_subset = real_data_subset.copy()
         syn_data_subset["timeseries"] = list(generated_ts)
 
-        real_data_inv = dataset.inverse_transform(real_data_subset)
-        syn_data_inv = dataset.inverse_transform(syn_data_subset)
+        # When normalize=False but a pretrained normalizer was applied via apply_pretrained_normalizer,
+        # dataset.inverse_transform() is a no-op (it checks self.normalize). Do the inverse manually.
+        normalizer = getattr(dataset, "_normalizer", None)
+        if not getattr(dataset, "normalize", True) and normalizer is not None:
+            def _inv(df):
+                split = dataset.split_timeseries(df.copy())
+                split = normalizer.inverse_transform(split)
+                return dataset.merge_timeseries_columns(split)
+            real_data_inv = _inv(real_data_subset)
+            syn_data_inv = _inv(syn_data_subset)
+        else:
+            real_data_inv = dataset.inverse_transform(real_data_subset)
+            syn_data_inv = dataset.inverse_transform(syn_data_subset)
 
         real_data_array = np.stack(real_data_inv["timeseries"])
         syn_data_array = np.stack(syn_data_inv["timeseries"])
@@ -382,9 +410,29 @@ class Evaluator:
             ):
                 rare_mask = real_data_subset["is_rare"].values
 
+            # Metrics in raw (un-normalized) domain
             self.compute_quality_metrics(
-                real_data_array, syn_data_array, real_data_inv, rare_mask
+                real_data_array, syn_data_array, real_data_inv, rare_mask,
+                log_prefix="[raw] ",
             )
 
+            # Metrics in normalized (z) domain for cross-domain comparability.
+            # Fires whenever a normalizer is available — whether data was pre-normalized by dataset
+            # init (normalize=True) or normalized in-place via apply_pretrained_normalizer (normalize=False).
+            if (
+                getattr(dataset, "_normalizer", None) is not None
+                and "timeseries" in real_data_subset.columns
+            ):
+                real_data_norm = np.stack(real_data_subset["timeseries"].values)
+                syn_data_norm = generated_ts
+                logger.info("[Cents] Computing metrics in normalized domain (z-space) for cross-domain comparison.")
+                normalized_metrics = {}
+                self.compute_quality_metrics(
+                    real_data_norm, syn_data_norm, real_data_inv, rare_mask,
+                    target=normalized_metrics,
+                    log_prefix="[normalized] ",
+                )
+                self.current_results["metrics"]["normalized_domain"] = normalized_metrics
+
         if self.cfg.evaluator.eval_disentanglement:
-            self.compute_disentanglement_metrics(context_vars, model)
+            self.compute_disentanglement_metrics(static_context_vars, model)
