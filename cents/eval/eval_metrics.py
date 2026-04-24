@@ -1,14 +1,21 @@
 import warnings
 from functools import partial
-from typing import Dict, Tuple
+from itertools import product
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import scipy
 from dtaidistance import dtw
-from sklearn.linear_model import Ridge
-from sklearn.metrics import mutual_info_score, r2_score
+from scipy.stats import f as f_dist
+from scipy.stats import wasserstein_distance
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import mutual_info_score, r2_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from statsmodels.tsa.tsatools import lagmat
 
 from cents.eval.eval_utils import (
     gaussian_kernel_matrix,
@@ -202,14 +209,259 @@ def Context_FID(ori_data: np.ndarray, generated_data: np.ndarray) -> float:
         return float("nan")
 
     return calculate_fid(ori_rep, gen_rep)
-    
-    ori_represenation = model.encode(ori_data, encoding_window="full_series")
-    gen_represenation = model.encode(generated_data, encoding_window="full_series")
-    idx = np.random.permutation(ori_data.shape[0])
-    ori_represenation = ori_represenation[idx]
-    gen_represenation = gen_represenation[idx]
-    results = calculate_fid(ori_represenation, gen_represenation)
-    return results
+
+
+def compute_cfs(
+    x_real: np.ndarray,
+    x_synth: np.ndarray,
+    c: np.ndarray,
+    n_folds: int = 5,
+) -> float:
+    """
+    Compute Context Faithfulness Score (CFS).
+
+    Trains a classifier to distinguish real (x, c) pairs from synthetic (x, c) pairs
+    using cross-validation, then returns 2 * |AUROC - 0.5|.
+
+    Args:
+        x_real:  (N, T, D_x) real time series
+        x_synth: (N, T, D_x) synthetic time series
+        c:       (N, T, D_c) shared context (same for real and synthetic)
+        n_folds: number of cross-validation folds
+
+    Returns:
+        float: CFS in [0, 1]. 0 = indistinguishable (perfect), 1 = fully separable (failed).
+    """
+    N = x_real.shape[0]
+
+    real_pairs = np.concatenate([x_real, c], axis=-1)   # (N, T, D_x+D_c)
+    synth_pairs = np.concatenate([x_synth, c], axis=-1)  # (N, T, D_x+D_c)
+
+    # Mean pool over time → fixed-size vectors
+    X_real_enc = real_pairs.mean(axis=1)   # (N, D_x+D_c)
+    X_synth_enc = synth_pairs.mean(axis=1) # (N, D_x+D_c)
+
+    X_all = np.concatenate([X_real_enc, X_synth_enc], axis=0)  # (2N, D)
+    y_all = np.concatenate([np.ones(N), np.zeros(N)])           # (2N,)
+
+    # Drop rows with NaN
+    valid = ~np.isnan(X_all).any(axis=1)
+    X_all = X_all[valid]
+    y_all = y_all[valid]
+
+    if len(X_all) < 2 * n_folds or len(np.unique(y_all)) < 2:
+        warnings.warn("compute_cfs: insufficient valid samples; returning nan.")
+        return float("nan")
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    auroc_scores = []
+    for train_idx, val_idx in skf.split(X_all, y_all):
+        clf = LogisticRegression(max_iter=1000, random_state=42)
+        clf.fit(X_all[train_idx], y_all[train_idx])
+        proba = clf.predict_proba(X_all[val_idx])[:, 1]
+        auroc_scores.append(roc_auc_score(y_all[val_idx], proba))
+
+    mean_auroc = float(np.mean(auroc_scores))
+    return float(2.0 * abs(mean_auroc - 0.5))
+
+
+def _build_lag_matrix(x: np.ndarray, max_lag: int) -> np.ndarray:
+    """Return (T-max_lag, max_lag) lag matrix with rows [x_{t-1}, ..., x_{t-L}]."""
+    return lagmat(x, maxlag=max_lag, trim="forward", original="ex")[max_lag:]
+
+
+def _compute_f_stats_batch(
+    x_arr: np.ndarray,
+    c_arr: np.ndarray,
+    max_lag: int,
+    pairs: List[Tuple[int, int]],
+) -> np.ndarray:
+    """Compute mean F-statistic per sample for the given (dx, dc) pairs."""
+    N = x_arr.shape[0]
+    f_per_sample = []
+    for i in range(N):
+        f_vals = []
+        for dx, dc in pairs:
+            xi = x_arr[i, :, dx]
+            ci = c_arr[i, :, dc]
+
+            if np.isnan(xi).any() or np.isnan(ci).any():
+                continue
+
+            X_x = _build_lag_matrix(xi, max_lag)  # (T-max_lag, max_lag)
+            X_c = _build_lag_matrix(ci, max_lag)   # (T-max_lag, max_lag)
+            y = xi[max_lag:]
+
+            ones = np.ones((len(y), 1))
+            X_r = np.hstack([ones, X_x])              # restricted: own lags only
+            X_u = np.hstack([ones, X_x, X_c])         # unrestricted: own + c lags
+
+            beta_r, _, _, _ = np.linalg.lstsq(X_r, y, rcond=None)
+            beta_u, _, _, _ = np.linalg.lstsq(X_u, y, rcond=None)
+
+            rss_r = float(np.sum((y - X_r @ beta_r) ** 2))
+            rss_u = float(np.sum((y - X_u @ beta_u) ** 2))
+
+            df1 = max_lag
+            df2 = len(y) - 2 * max_lag - 1
+
+            if df2 <= 0 or rss_u < 1e-12:
+                continue
+
+            F = ((rss_r - rss_u) / df1) / (rss_u / df2)
+            f_vals.append(F)
+
+        if f_vals:
+            f_per_sample.append(float(np.mean(f_vals)))
+
+    return np.array(f_per_sample)
+
+
+def compute_gcp(
+    x_real: np.ndarray,
+    x_synth: np.ndarray,
+    c_real: np.ndarray,
+    c_synth: np.ndarray,
+    max_lag: int = 5,
+    alpha: float = 0.05,
+) -> Tuple[float, Dict]:
+    """
+    Compute Granger Causality Preservation (GCP).
+
+    Measures how well synthetic data preserves the Granger-causal structure from
+    context c → signal x, via Wasserstein distance between F-statistic distributions.
+
+    Args:
+        x_real:  (N, T, D_x) real signal
+        x_synth: (N, T, D_x) synthetic signal
+        c_real:  (N, T, D_c) context for real data
+        c_synth: (N, T, D_c) context for synthetic data
+        max_lag: maximum lag order (capped at T // 10 for short series)
+        alpha:   significance threshold for diagnostic sig-rate computation
+
+    Returns:
+        gcp:         float >= 0. 0 = perfect preservation. Higher = more divergence.
+        diagnostics: dict with sig_rate_real, sig_rate_synth, sig_rate_delta
+    """
+    N, T, D_x = x_real.shape
+    D_c = c_real.shape[-1]
+
+    # Cap lag for short series
+    max_lag = min(max_lag, max(1, T // 10))
+
+    pairs = list(product(range(D_x), range(D_c)))
+
+    F_real = _compute_f_stats_batch(x_real, c_real, max_lag, pairs)
+    F_synth = _compute_f_stats_batch(x_synth, c_synth, max_lag, pairs)
+
+    if len(F_real) == 0 or len(F_synth) == 0:
+        warnings.warn("compute_gcp: no valid F-statistics computed; returning nan.")
+        return float("nan"), {}
+
+    gcp = float(wasserstein_distance(F_real, F_synth))
+
+    # Diagnostics: significance rates
+    df2 = T - 2 * max_lag - 1
+    if df2 > 0:
+        pvals_real = f_dist.sf(F_real, max_lag, df2)
+        pvals_synth = f_dist.sf(F_synth, max_lag, df2)
+        sig_real = float(np.mean(pvals_real < alpha))
+        sig_synth = float(np.mean(pvals_synth < alpha))
+    else:
+        sig_real = sig_synth = float("nan")
+
+    diagnostics = {
+        "sig_rate_real": sig_real,
+        "sig_rate_synth": sig_synth,
+        "sig_rate_delta": float(abs(sig_real - sig_synth)) if not np.isnan(sig_real) else float("nan"),
+    }
+
+    return gcp, diagnostics
+
+
+def compute_context_recovery_score(
+    real_data: np.ndarray,
+    syn_data: np.ndarray,
+    context_labels: Dict[str, np.ndarray],
+    continuous_vars: Optional[List[str]] = None,
+    test_ratio: float = 0.2,
+) -> Tuple[float, Dict[str, Dict]]:
+    """
+    Context Recovery Score: measures whether static context is reflected in generated outputs.
+
+    Trains a predictor f: timeseries -> context_label on real data, then evaluates
+    accuracy on synthetic data conditioned on the same labels.  High score means
+    the model correctly encodes the conditioning variable in the output.
+
+    For categorical variables: classification accuracy (chance = 1/n_classes).
+    For continuous variables: R² (0 = no recovery, 1 = perfect).
+
+    Args:
+        real_data:      (N, T, D) real time series
+        syn_data:       (N, T, D) synthetic time series (same conditioning as real)
+        context_labels: {name: (N,) array of integer labels or float values}
+        continuous_vars: names of continuous context variables; all others treated as categorical
+        test_ratio:     fraction of real data held out for real_baseline evaluation
+
+    Returns:
+        overall_score: mean synth_score across all context variables
+        per_var: {name: {"synth_score": float, "real_baseline": float, "type": str}}
+    """
+    if continuous_vars is None:
+        continuous_vars = []
+
+    N, T, D = real_data.shape
+
+    def _features(data: np.ndarray) -> np.ndarray:
+        """Mean + std pool over time → (N, 2*D) fixed-size representation."""
+        return np.concatenate([data.mean(axis=1), data.std(axis=1)], axis=-1)
+
+    X_real = _features(real_data)
+    X_synth = _features(syn_data)
+
+    rng = np.random.RandomState(42)
+    idx = rng.permutation(N)
+    test_size = max(1, int(N * test_ratio))
+    train_idx = idx[test_size:]
+    test_idx = idx[:test_size]
+
+    per_var: Dict[str, Dict] = {}
+    scores: List[float] = []
+
+    for name, labels in context_labels.items():
+        labels_f = labels.astype(float)
+        if np.isnan(labels_f).any():
+            per_var[name] = {"synth_score": float("nan"), "real_baseline": float("nan"), "type": "unknown"}
+            continue
+
+        if name in continuous_vars:
+            y = labels_f
+            clf = Ridge(alpha=1e-3, fit_intercept=True)
+            clf.fit(X_real[train_idx], y[train_idx])
+            real_baseline = float(r2_score(y[test_idx], clf.predict(X_real[test_idx])))
+            synth_score = float(r2_score(y, clf.predict(X_synth)))
+            score_type = "r2"
+        else:
+            y = labels.astype(int)
+            n_classes = len(np.unique(y))
+            if n_classes < 2:
+                per_var[name] = {"synth_score": float("nan"), "real_baseline": float("nan"), "type": "accuracy"}
+                continue
+            clf = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, random_state=42))
+            clf.fit(X_real[train_idx], y[train_idx])
+            real_baseline = float(np.mean(clf.predict(X_real[test_idx]) == y[test_idx]))
+            synth_score = float(np.mean(clf.predict(X_synth) == y))
+            score_type = "accuracy"
+
+        per_var[name] = {
+            "synth_score": synth_score,
+            "real_baseline": real_baseline,
+            "type": score_type,
+        }
+        scores.append(synth_score)
+
+    overall = float(np.mean(scores)) if scores else float("nan")
+    return overall, per_var
 
 
 def compute_mig(

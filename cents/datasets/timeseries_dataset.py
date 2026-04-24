@@ -125,8 +125,11 @@ class TimeSeriesDataset(Dataset):
 
 
         self.context_cfg = get_context_config()
-        self.dynamic_module_type = self.context_cfg.dynamic_context.type 
-        self.static_module_type = self.context_cfg.static_context.type
+        self.dynamic_module_type = self.context_cfg.dynamic_context.type
+        # Normalizer uses its own context type (defaults to mlp) so that switching the
+        # diffusion model to a heavier static embedder (e.g. transformer) doesn't affect
+        # the much simpler normalizer training.
+        self.static_module_type = getattr(self.context_cfg.normalizer, "context_type", "mlp")
         self.stats_head_type = self.context_cfg.normalizer.stats_head_type
 
         is_ddp_subprocess = self._is_ddp_subprocess()
@@ -150,7 +153,7 @@ class TimeSeriesDataset(Dataset):
                     print(f"[Main Process] Cached normalized data for subprocesses")
         self.data = self.merge_timeseries_columns(self.data)
         self.data = self.data.reset_index()
-        
+
         # Check if we should skip heavy processing for DDP
         if is_ddp_subprocess and skip_heavy_processing:
             print("skipped rarity computation for DDP compatibility")
@@ -509,12 +512,19 @@ class TimeSeriesDataset(Dataset):
         Returns:
             pd.DataFrame: DataFrame with 'is_frequency_rare' column.
         """
-        freq = self.data.groupby(self.context_vars).size().reset_index(name="count")
+        # Continuous vars are floats (e.g. UTM coordinates) — grouping by them would create
+        # one group per unique value, making rarity meaningless. Use only discrete vars.
+        continuous = set(getattr(self, "continuous_vars", []))
+        groupby_vars = [v for v in self.context_vars if v not in continuous]
+        if not groupby_vars:
+            self.data["is_frequency_rare"] = False
+            return self.data
+        freq = self.data.groupby(groupby_vars).size().reset_index(name="count")
         threshold = freq["count"].quantile(0.1)
         freq["is_frequency_rare"] = freq["count"] < threshold
         self.data = self.data.merge(
-            freq[self.context_vars + ["is_frequency_rare"]],
-            on=self.context_vars,
+            freq[groupby_vars + ["is_frequency_rare"]],
+            on=groupby_vars,
             how="left",
         )
         return self.data

@@ -1,9 +1,11 @@
 import logging
 import math
 import os
+import random
 from pathlib import Path
 import json
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -15,9 +17,11 @@ from cents.models.registry import get_model_type_from_hf_name
 from cents.datasets.pecanstreet import PecanStreetDataset
 from cents.datasets.commercial import CommercialDataset
 from cents.datasets.airquality import AirQualityDataset
+from cents.datasets.metraq import MetraqDataset
+from cents.datasets.walmart import WalmartDataset
 from cents.eval.eval import Evaluator
 from cents.utils.config_loader import load_yaml, apply_overrides
-from cents.utils.utils import set_context_config_path
+from cents.utils.utils import set_context_config_path, set_context_overrides
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +58,10 @@ def _load_dataset(name: str, dataset_cfg: OmegaConf, run_dir: str = None):
         return CommercialDataset(**kwargs)
     if name == "airquality":
         return AirQualityDataset(**kwargs)
+    if name == "metraq":
+        return MetraqDataset(**kwargs)
+    if name == "walmart":
+        return WalmartDataset(**kwargs)
     raise ValueError(f"Dataset {name} not supported. Use: pecanstreet, commercial, airquality.")
 
 
@@ -148,7 +156,7 @@ def main() -> None:
         "--dataset",
         type=str,
         default="pecanstreet",
-        choices=("pecanstreet", "commercial", "airquality"),
+        choices=("pecanstreet", "commercial", "airquality", "metraq", "walmart"),
         help="Dataset name (must match the one used to train the model).",
     )
     parser.add_argument(
@@ -225,6 +233,13 @@ def main() -> None:
         help="Path to custom context config YAML file (optional).",
     )
     parser.add_argument(
+        "--context-overrides",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Override context config values (e.g., 'static_context.type=mlp' 'dynamic_context.type=cnn').",
+    )
+    parser.add_argument(
         "--no-normalizer-global-preprocessing",
         action="store_true",
         help="Use normalizer without global-stats preprocessing (match training that used --no-normalizer-global-preprocessing).",
@@ -248,6 +263,12 @@ def main() -> None:
         help="Limit evaluation to this many samples (applied as dataset max_samples override).",
     )
     parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible sampling (sets Python, NumPy, and PyTorch seeds).",
+    )
+    parser.add_argument(
         "--cfg-scale",
         type=float,
         default=1.0,
@@ -259,6 +280,19 @@ def main() -> None:
             "Only applies to fast (DDIM) sampling."
         ),
     )
+    parser.add_argument(
+        "--save-path",
+        type=str,
+        default=None,
+        help="Path to save evaluation results."
+    )
+    parser.add_argument(
+        "--model-config",
+        type=str,
+        default=None,
+        help="Path to a model config YAML file. Overrides the default cents/config/model/{model_type}.yaml when using --model-ckpt.",
+    )
+
     args = parser.parse_args()
 
     use_run_path = args.run_path is not None
@@ -269,9 +303,22 @@ def main() -> None:
     if use_run_path and args.model_ckpt:
         parser.error("Do not use --model-ckpt with --run-path; checkpoint is resolved from run-path and --epoch.")
 
+    # Set random seed before any dataset loading so that subsampling is reproducible
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        logging.info("Random seed set to %d", args.seed)
+
     # Set custom context config path if provided
     if args.context_config_path:
         set_context_config_path(args.context_config_path)
+
+    # Set context config overrides if provided
+    if args.context_overrides:
+        set_context_overrides(args.context_overrides)
 
     if use_run_path:
         run_path = Path(args.run_path).resolve()
@@ -361,8 +408,9 @@ def main() -> None:
         cfg.evaluator = eval_cfg
         cfg.wandb = top_cfg.get("wandb", {})
         cfg.device = f"cuda:{args.device}"
+        model_config_path = args.model_config if args.model_config else f"cents/config/model/{model_type}.yaml"
         cfg.model = OmegaConf.create(
-            OmegaConf.to_container(OmegaConf.load(f"cents/config/model/{model_type}.yaml"), resolve=True)
+            OmegaConf.to_container(OmegaConf.load(model_config_path), resolve=True)
         )
         cfg.dataset = OmegaConf.create(OmegaConf.to_container(dataset.cfg, resolve=True))
         if args.no_normalizer_global_preprocessing:
@@ -472,6 +520,10 @@ def main() -> None:
         with open(Path(args.save_dir) / "metrics.json", "w") as f:
             json.dump(_sanitize_for_json(metrics), f, indent=4)
         print(f"\n✅ Results saved to {Path(args.save_dir) / "metrics.json"}")
+    elif args.save_path:
+        with open(args.save_path, "w") as f:
+            json.dump(_sanitize_for_json(metrics), f, indent=4)
+        print(f"\n✅ Results saved to {args.save_path}")
     print("\n" + "=" * 60)
 
 

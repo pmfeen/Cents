@@ -2,6 +2,8 @@ import copy
 import math
 from typing import Any, Optional, Tuple
 
+from pyparsing import alphas
+
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -194,6 +196,7 @@ class Diffusion_TS(GenerativeModel):
             n_embd=cfg.model.d_model,
             conv_params=[cfg.model.kernel_size, cfg.model.padding_size],
             cond_dim=self.embedding_dim,
+            has_dynamic_ctx=self.dynamic_context_module is not None,
         )
 
         self.blue_noise_power = cfg.model.blue_noise_power
@@ -213,9 +216,8 @@ class Diffusion_TS(GenerativeModel):
             raise ValueError("Unknown beta schedule")
 
         eps = 1e-5
-        alphas = (1.0 - betas).double()
-        alphas_cumprod = torch.cumprod(alphas, dim=0).float()
-        alphas_cumprod = alphas_cumprod.clamp(min=eps, max=1.0 - eps)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0).clamp(min=eps, max=1.0 - eps)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0 - eps)
 
         self.num_timesteps = betas.shape[0]
@@ -584,12 +586,17 @@ class Diffusion_TS(GenerativeModel):
             _nan_check(pred_noise, "forward pred_noise (eps)")
             loss_per_elem = self.recon_loss_fn(pred_noise, noise, reduction="none")
         else:  # v
-            pred_noise = self.predict_noise_from_start(x_noisy, t, x_start_pred)
-            _nan_check(pred_noise, "forward pred_noise (v)")
-            pred_v = (
-                self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * pred_noise
-                - self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * x_start_pred
-            )
+            # Compute pred_v directly from x_start_pred and x_noisy, avoiding the
+            # two-step path through predict_noise_from_start which divides by
+            # sqrt_recipm1_alphas_cumprod — a value near 0 at low t (cosine schedule
+            # gives ~0.01 at t=0), amplifying prediction errors ~100x into pred_noise
+            # before they land in pred_v. The algebraic identity:
+            #   v = sqrt(α_bar)*ε - sqrt(1-α_bar)*x0
+            #   ε = (x_noisy - sqrt(α_bar)*x0) / sqrt(1-α_bar)
+            # => pred_v = (sqrt(α_bar)*x_noisy - x0) / sqrt(1-α_bar).clamp(min=1e-3)
+            sqrt_ab = self.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+            sqrt_1mab = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1).clamp(min=1e-3)
+            pred_v = (sqrt_ab * x_noisy - x_start_pred) / sqrt_1mab
             true_v = (
                 self.sqrt_alphas_cumprod[t].view(-1, 1, 1) * noise
                 - self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1) * x
@@ -656,6 +663,9 @@ class Diffusion_TS(GenerativeModel):
             total_loss: Scalar training loss.
         """
         ts_batch, static_context_batch, dynamic_context_batch = batch
+        # print("BEFORE PRINT I")
+        # print(ts_batch, static_context_batch, dynamic_context_batch)
+        # print("AFTER PRINT I")
         _nan_check(ts_batch, "training_step ts_batch")
         rec_loss, cond_class_logits, fourier_loss = self(ts_batch, static_context_batch, dynamic_context_batch)
         _nan_check(rec_loss, "training_step rec_loss")
@@ -674,14 +684,9 @@ class Diffusion_TS(GenerativeModel):
                 loss = self.auxiliary_loss(outputs, labels)
             _nan_check(loss, f"training_step cond_loss[{var_name}]")
             cond_loss += loss.mean()
-
-        #     # if var_name in self.continuous_context_vars:
-        #     #     print(var_name)
-        #     #     print(loss)
-        #     #     print(outputs.mean(), labels.mean())
-
-        
-        # cond_loss /= len(cond_class_logits)
+        # Normalize by number of context variables so the weight is dataset-independent
+        # if len(cond_class_logits) > 0:
+        #     cond_loss = cond_loss / len(cond_class_logits)
 
         h, _, _ = self._get_context_embedding(static_context_batch, dynamic_context_batch)
         _nan_check(h, "training_step h (for tc)")
@@ -697,11 +702,16 @@ class Diffusion_TS(GenerativeModel):
         )
         _nan_check(total_loss, f"training_step total_loss batch_idx={batch_idx}")
 
+        # Skip this batch entirely if loss is bad — avoids corrupting weights before EMA can help
+        if not torch.isfinite(total_loss):
+            print(f"[training_step] Non-finite loss ({total_loss.item()}) at batch {batch_idx}, skipping.")
+            return None
+
         self.log_dict(
             {
                 "train_loss": total_loss.item(),
                 "rec_loss": rec_loss.item(),
-                "cond_loss": cond_loss.item(),
+                "cond_loss": cond_loss.item() if isinstance(cond_loss, torch.Tensor) else float(cond_loss),
                 "tc_loss": tc_term,
                 "fourier_loss": fourier_loss.item(),
             },
@@ -724,40 +734,55 @@ class Diffusion_TS(GenerativeModel):
         scheduler = ReduceLROnPlateau(optimizer, **self.cfg.trainer.lr_scheduler_params)
         return {
             "optimizer": optimizer,
-            "lr_scheduler": scheduler,
-            "monitor": "train_loss",
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "train_loss"},
         }
 
     def on_train_start(self) -> None:
         """
         Initialize EMA helper at start of training.
         """
-        self._ema = EMA(
-            self.model,
-            beta=self.cfg.model.ema_decay,
-            update_every=self.cfg.model.ema_update_interval,
-        )
+        if self._ema is None:
+            object.__setattr__(self, '_ema', EMA(
+                self.model,
+                beta=self.cfg.model.ema_decay,
+                update_every=self.cfg.model.ema_update_interval,
+            ))
+        # EMA is not a registered submodule so PL won't move it automatically
+        self._ema.to(self.device)
 
-    # def on_after_backward(self) -> None:
-    #     """
-    #     Check gradients after backward pass but before optimizer step.
-    #     This is the right place to inspect gradients before they're zeroed.
-    #     """
-    #     # Get current batch index from trainer
-    #     for name, p in self.named_parameters():
-    #         if p.grad is None:
-    #             continue
-    #         if p.grad.stride() != p.stride():
-    #             print("stride mismatch:", name,
-    #                 "param", tuple(p.shape), p.stride(),
-    #                 "grad", tuple(p.grad.shape), p.grad.stride())
-    #             break
+    def on_train_epoch_start(self) -> None:
+        """
+        Apply linear LR warmup for the first warmup_epochs epochs.
+        After warmup, ReduceLROnPlateau takes over untouched.
+        """
+        warmup_epochs = self.cfg.trainer.get("warmup_epochs", 0)
+        if warmup_epochs <= 0:
+            return
+        epoch = self.current_epoch
+        if epoch >= warmup_epochs:
+            return
+        target_lr = self.cfg.trainer.base_lr
+        warmup_lr = target_lr * max(0.01, epoch / warmup_epochs)
+        for opt in self.trainer.optimizers:
+            for pg in opt.param_groups:
+                pg["lr"] = warmup_lr
 
+    def on_before_optimizer_step(self, optimizer) -> None:
+        """Log global gradient norm each step for observability."""
+        total_norm_sq = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                total_norm_sq += p.grad.detach().float().norm(2).item() ** 2
+        grad_norm = total_norm_sq ** 0.5
+        self.log("grad_norm", grad_norm, on_step=True, on_epoch=False, prog_bar=False)
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         """
         Apply EMA update after each batch end.
+        Skip if the step was skipped due to NaN loss (outputs is None).
         """
+        if outputs is None:
+            return
         if hasattr(self, '_ema') and self._ema:
             self._ema.update()
 
@@ -794,6 +819,29 @@ class Diffusion_TS(GenerativeModel):
     #             raise ValueError("No EMA model weights found in checkpoint")
     #     else:
     #         raise ValueError("No EMA keys found in checkpoint")
+    def load_state_dict(self, state_dict, strict=True):
+        # Strip legacy _ema.* keys — EMA is restored separately via on_load_checkpoint.
+        # Old checkpoints have these because _ema was previously a registered submodule.
+        filtered = {k: v for k, v in state_dict.items() if not k.startswith('_ema.')}
+        return super().load_state_dict(filtered, strict=strict)
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        if 'ema_state_dict' in checkpoint and False:
+            if self._ema is None:
+                object.__setattr__(self, '_ema', EMA(
+                    self.model,
+                    beta=self.cfg.model.ema_decay,
+                    update_every=self.cfg.model.ema_update_interval,
+                ))
+            self._ema.ema_model.load_state_dict(checkpoint['ema_state_dict'])
+            print(f"[EMA] Restored EMA weights from checkpoint")
+        else:
+            print(f"[EMA] No EMA weights in checkpoint, initializing fresh")
+
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        if self._ema is not None:
+            checkpoint['ema_state_dict'] = self._ema.ema_model.state_dict()
+
 
     def _predict_x0_from_xt_with_grad(
         self, x_t: torch.Tensor, t: torch.Tensor, embedding: torch.Tensor,
@@ -1182,11 +1230,11 @@ class Diffusion_TS(GenerativeModel):
         """
         if not hasattr(self, '_ema') or self._ema is None:
             print("Initializing EMA helper for inference...")
-            self._ema = EMA(
+            object.__setattr__(self, '_ema', EMA(
                 self.model,
                 beta=self.cfg.model.ema_decay,
                 update_every=self.cfg.model.ema_update_interval,
-            )
+            ))
     def stratified_timesteps(self, batch_size: int, num_timesteps: int, k_bins: int, device=None) -> torch.Tensor:
         device = device or "cpu"
         k_bins = min(k_bins, batch_size)
@@ -1204,40 +1252,30 @@ class Diffusion_TS(GenerativeModel):
 
 
 class EMA(nn.Module):
-    """
-    Exponential Moving Average (EMA) helper for model parameters.
-    """
-    def __init__(self, model: nn.Module, beta: float = 0.9999, update_every: int = 10):
+    def __init__(self, model, beta, update_every):
         super().__init__()
         self.beta = beta
         self.update_every = update_every
         self.step = 0
-
-        # CRITICAL FIX 1: self.ema_model is the ONLY deepcopy. 
-        # It holds the shadow weights.
         self.ema_model = copy.deepcopy(model)
         self.ema_model.eval()
         self.ema_model.requires_grad_(False)
         
-        # CRITICAL FIX 2: We keep a reference to the LIVE model (not a copy)
-        # so we can grab the latest trained weights during update().
-        self.source_model = model 
+        # Store as plain python attribute, not nn.Module attribute
+        # This prevents it being registered as a submodule and saved in state_dict
+        object.__setattr__(self, '_source_model', model)
         
-        # Buffer to store temporary weights for the context manager
         self.collected_params = []
 
-    def update(self) -> None:
-        """
-        Update the shadow parameters using the source model's current weights.
-        """
+    def update(self):
         self.step += 1
         if self.step % self.update_every != 0:
             return
-        
         with torch.no_grad():
-            # Zip the shadow model (ema) against the live model (source)
-            for ema_p, src_p in zip(self.ema_model.parameters(), self.source_model.parameters()):
-                # ema_new = beta * ema_old + (1 - beta) * current_weight
+            for ema_p, src_p in zip(
+                self.ema_model.parameters(), 
+                self._source_model.parameters()
+            ):
                 ema_p.data.mul_(self.beta).add_(src_p.data, alpha=1.0 - self.beta)
 
     def store(self, parameters):
